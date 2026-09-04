@@ -17,6 +17,11 @@ Windows 10/11 会要求在“默认应用”页面完成最终确认。播放器
 
 播放器会自动选择硬件解码，并根据当前显示器自动输出 HDR 或把 HDR/杜比视界正确映射到 SDR。普通用户不需要配置播放器。
 
+## 下载软件包
+
+- [下载 LumaPlayer-0.4.1-win-x64.zip](./LumaPlayer-0.4.1-win-x64.zip)
+- [打开 GitHub v0.4.1 发行版](https://github.com/love191954/luma-player/releases/tag/v0.4.1)
+
 ## 操作
 
 | 操作 | 快捷键 |
