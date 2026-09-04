@@ -1,0 +1,70 @@
+{
+  "product": "Luma Player",
+  "version": "0.4.1",
+  "platform": "Windows x64",
+  "generatedAt": "2026-09-01T07:01:15.7391570+08:00",
+  "archive": "LumaPlayer-0.4.1-win-x64.zip",
+  "sha256": "EE57A826DC0EC496D76BFDD6A3940CC90334ED839E4D98CD5683C99049A9FA15",
+  "installer": {
+    "entryPoint": "安装 Luma Player.bat",
+    "mode": "per-user",
+    "requiresAdministrator": false
+  },
+  "files": [
+    {
+      "path": "安装 Luma Player.bat",
+      "size": 136,
+      "sha256": "F02BBC2BFB1171AA348A88A091599F298B8997DE944F4AB46EAD01D4CE658947"
+    },
+    {
+      "path": "d3dcompiler_43.dll",
+      "size": 4481992,
+      "sha256": "4B074A3976399DC735484F5D43D04B519B7BDEE8AC719D9AB8ED6BD4E6BE0345"
+    },
+    {
+      "path": "input.conf",
+      "size": 441,
+      "sha256": "C7A6557673EA4A41E336162D89E5FD3A568110B609BBF99038F8BC8B22C911A7"
+    },
+    {
+      "path": "Install-LumaPlayer.ps1",
+      "size": 5050,
+      "sha256": "26A361F0A3DD72F2475BDDA67577E4782AC50309A4CEC9E320E9A99C8D28DEAD"
+    },
+    {
+      "path": "luma.ico",
+      "size": 372526,
+      "sha256": "7B117DED83C81C078573C1B455EC5A7B4E7A37113B798E904FCCC09EA20606CB"
+    },
+    {
+      "path": "LumaPlayer.exe",
+      "size": 421888,
+      "sha256": "015E8E692DE92E9D2B358ADCA606EA444C0EA772270D7FB3911AB6592151ECC7"
+    },
+    {
+      "path": "mpv.com",
+      "size": 3584,
+      "sha256": "A6C822DB4EA4F4207B963E56EE50A125B5720031ACA22C88EE00524940A1C5AC"
+    },
+    {
+      "path": "mpv.exe",
+      "size": 120308736,
+      "sha256": "1645E57569C0AF58A70C61257F3716F2EE6EB31BB170EDC51F3F25A0B8D0D99C"
+    },
+    {
+      "path": "README.md",
+      "size": 5340,
+      "sha256": "D490FB121B17D8E8ADD1CC028559EDC6646E4F196E4169BEDBB1768CCF83D20B"
+    },
+    {
+      "path": "THIRD_PARTY_NOTICES.md",
+      "size": 1108,
+      "sha256": "CA423CB5F9E4F86D62098D5BF72413F3ED856811F36E49882C863CC1CD60AAE9"
+    },
+    {
+      "path": "licenses/mpv/GPL-2.0.txt",
+      "size": 17984,
+      "sha256": "EDAEF632CBB643E4E7A221717A6C441A4C1A7C918E6E4D56DEBC3D8739B233F6"
+    }
+  ]
+}

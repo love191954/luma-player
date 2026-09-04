@@ -1,0 +1,12 @@
+.cache/
+.superpowers/
+dist/mpv.exe
+dist/RAWImageProcessor.exe
+dist/rembg_worker/
+dist/*.dll
+dist/*.com
+dist/*.bat
+dist/licenses/
+tests/*.exe
+diagnostics/
+release/
