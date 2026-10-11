@@ -49,7 +49,94 @@ namespace LumaPlayer
             if (args != null && args.Length > 0 && File.Exists(args[0]))
                 initialFile = Path.GetFullPath(args[0]);
 
-            Application.Run(new PlayerForm(initialFile));
+            // Double-clicking another video should reuse the open window
+            // instead of starting a second player that plays on top of it.
+            bool isPrimary;
+            using (Mutex instanceMutex = new Mutex(false, SingleInstance.MutexName, out isPrimary))
+            {
+                if (!isPrimary && SingleInstance.TrySendToPrimary(initialFile))
+                    return;
+                Application.Run(new PlayerForm(initialFile, isPrimary));
+            }
+        }
+    }
+
+    internal static class SingleInstance
+    {
+        [DllImport("user32.dll")]
+        private static extern bool AllowSetForegroundWindow(int processId);
+
+        private const int AnyProcess = -1;
+        private static readonly string InstanceKey = BuildInstanceKey();
+
+        public static string MutexName
+        {
+            get { return "Local\\LumaPlayer-" + InstanceKey; }
+        }
+
+        private static string PipeName
+        {
+            get { return "LumaPlayer-Open-" + InstanceKey; }
+        }
+
+        private static string BuildInstanceKey()
+        {
+            string user;
+            try { user = System.Security.Principal.WindowsIdentity.GetCurrent().User.Value; }
+            catch { user = Environment.UserName; }
+            return user + "-" + Process.GetCurrentProcess().SessionId.ToString(CultureInfo.InvariantCulture);
+        }
+
+        public static bool TrySendToPrimary(string path)
+        {
+            try
+            {
+                using (NamedPipeClientStream client = new NamedPipeClientStream(".", PipeName, PipeDirection.Out))
+                {
+                    client.Connect(1500);
+                    AllowSetForegroundWindow(AnyProcess);
+                    using (StreamWriter writer = new StreamWriter(client, new UTF8Encoding(false)))
+                    {
+                        writer.WriteLine(path ?? "");
+                        writer.Flush();
+                    }
+                }
+                return true;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        public static void Listen(Action<string> onOpen)
+        {
+            Thread listener = new Thread(delegate()
+            {
+                while (true)
+                {
+                    try
+                    {
+                        using (NamedPipeServerStream server = new NamedPipeServerStream(PipeName, PipeDirection.In, 1))
+                        {
+                            server.WaitForConnection();
+                            using (StreamReader reader = new StreamReader(server, new UTF8Encoding(false)))
+                                onOpen(reader.ReadLine() ?? "");
+                        }
+                    }
+                    catch (IOException)
+                    {
+                        Thread.Sleep(200);
+                    }
+                    catch (Exception)
+                    {
+                        return;
+                    }
+                }
+            });
+            listener.IsBackground = true;
+            listener.Name = "LumaPlayer single instance";
+            listener.Start();
         }
     }
 
@@ -64,6 +151,7 @@ namespace LumaPlayer
         private static extern void SHChangeNotify(uint eventId, uint flags, IntPtr item1, IntPtr item2);
 
         private readonly string _initialFile;
+        private readonly bool _isPrimaryInstance;
         private readonly Panel _videoSurface;
         private readonly Panel _emptyState;
         private readonly LumaMark _emptyMark;
@@ -97,16 +185,21 @@ namespace LumaPlayer
         private bool _isSeeking;
         private bool _isFullscreen;
         private bool _cursorHidden;
+        private bool _eofReached;
         private double _duration;
         private double _position;
         private double _speed = 1;
+        private string _hwdec;
+        private double _pendingPosition;
+        private int _positionUpdateQueued;
         private Rectangle _restoreBounds;
         private FormBorderStyle _restoreBorderStyle;
         private FormWindowState _restoreWindowState;
 
-        public PlayerForm(string initialFile)
+        public PlayerForm(string initialFile, bool isPrimaryInstance)
         {
             _initialFile = initialFile;
+            _isPrimaryInstance = isPrimaryInstance;
             SuspendLayout();
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
             Text = "Luma Player";
@@ -224,6 +317,11 @@ namespace LumaPlayer
             _seekBar.ValueChanged += OnSeekRequested;
             _seekBar.SeekStarted += delegate { _isSeeking = true; };
             _seekBar.SeekEnded += delegate { _isSeeking = false; };
+            _seekBar.PreviewChanged += delegate
+            {
+                if (_duration > 0)
+                    UpdateTimeLabels(_duration * _seekBar.Value, _duration);
+            };
             timeline.Controls.Add(_seekBar, 0, 0);
 
             BufferedTableLayoutPanel row = new BufferedTableLayoutPanel();
@@ -391,14 +489,36 @@ namespace LumaPlayer
             PerformLayout();
             CenterEmptyState();
             Opacity = 1;
+            if (_isPrimaryInstance)
+                SingleInstance.Listen(OpenFromAnotherInstance);
             if (!String.IsNullOrEmpty(_initialFile))
                 BeginInvoke(new MethodInvoker(delegate { LoadFile(_initialFile); }));
+        }
+
+        private void OpenFromAnotherInstance(string path)
+        {
+            SafeUi(delegate
+            {
+                if (WindowState == FormWindowState.Minimized)
+                    WindowState = FormWindowState.Normal;
+                Activate();
+                if (!String.IsNullOrEmpty(path) && File.Exists(path))
+                    LoadFile(Path.GetFullPath(path));
+            });
         }
 
         private bool EnsureMpv()
         {
             if (_mpv != null && _mpv.IsRunning)
                 return true;
+
+            if (_mpv != null)
+            {
+                // The previous engine crashed; release it before starting a new one.
+                DetachMpv(_mpv);
+                _mpv.Dispose();
+                _mpv = null;
+            }
 
             string mpvPath = FindMpv();
             if (mpvPath == null)
@@ -423,11 +543,31 @@ namespace LumaPlayer
             catch (Exception ex)
             {
                 if (_mpv != null)
+                {
+                    DetachMpv(_mpv);
                     _mpv.Dispose();
+                }
                 _mpv = null;
                 ShowError("播放器核心启动失败", ex.Message);
                 return false;
             }
+        }
+
+        private void DetachMpv(MpvProcess mpv)
+        {
+            mpv.PropertyChanged -= OnMpvPropertyChanged;
+            mpv.EventReceived -= OnMpvEvent;
+            mpv.ClientMessageReceived -= OnMpvClientMessage;
+            mpv.EngineFailed -= OnMpvFailed;
+        }
+
+        private void SaveResumePosition()
+        {
+            if (!_hasFile || _mpv == null || !_mpv.IsRunning)
+                return;
+            // Finished videos start from the beginning next time.
+            bool finished = _eofReached || (_duration > 0 && _position >= _duration - 5);
+            _mpv.Command(finished ? "delete-watch-later-config" : "write-watch-later-config");
         }
 
         private string FindMpv()
@@ -459,7 +599,7 @@ namespace LumaPlayer
         {
             string[] properties = new string[]
             {
-                "time-pos", "duration", "pause", "volume", "mute", "speed", "media-title", "hwdec-current"
+                "time-pos", "duration", "pause", "volume", "mute", "speed", "media-title", "hwdec-current", "eof-reached"
             };
             for (int i = 0; i < properties.Length; i++)
                 _mpv.Observe(properties[i]);
@@ -488,8 +628,10 @@ namespace LumaPlayer
             if (!EnsureMpv())
                 return;
 
+            SaveResumePosition();
             _hasFile = true;
             _isPaused = false;
+            _eofReached = false;
             _duration = 0;
             _position = 0;
             _seekBar.Value = 0;
@@ -557,17 +699,20 @@ namespace LumaPlayer
 
         private void OnMpvPropertyChanged(string name, object value)
         {
+            if (name == "time-pos")
+            {
+                // mpv reports time-pos about once per frame. Keep only the latest
+                // value and queue at most one UI update so the window thread never
+                // falls behind during high frame rate playback.
+                Interlocked.Exchange(ref _pendingPosition, ToDouble(value));
+                if (Interlocked.Exchange(ref _positionUpdateQueued, 1) == 0)
+                    SafeUi(ApplyPendingPosition);
+                return;
+            }
+
             SafeUi(delegate
             {
-                if (name == "time-pos")
-                {
-                    double position = ToDouble(value);
-                    _position = position;
-                    if (!_isSeeking && _duration > 0)
-                        _seekBar.Value = Math.Max(0, Math.Min(1, position / _duration));
-                    UpdateTimeLabels(position, _duration);
-                }
-                else if (name == "duration")
+                if (name == "duration")
                 {
                     _duration = ToDouble(value);
                     UpdateTimeLabels(_position, _duration);
@@ -606,12 +751,28 @@ namespace LumaPlayer
                     string hw = Convert.ToString(value, CultureInfo.InvariantCulture);
                     if (!String.IsNullOrEmpty(hw) && hw != "no")
                     {
-                        _statusLabel.Tag = hw.ToUpperInvariant();
+                        _hwdec = hw.ToUpperInvariant();
                         if (_hasFile)
                             RefreshMediaStatus();
                     }
                 }
+                else if (name == "eof-reached")
+                {
+                    _eofReached = ToBool(value);
+                }
             });
+        }
+
+        private void ApplyPendingPosition()
+        {
+            Interlocked.Exchange(ref _positionUpdateQueued, 0);
+            double position = Interlocked.CompareExchange(ref _pendingPosition, 0, 0);
+            _position = position;
+            if (_isSeeking)
+                return;
+            if (_duration > 0)
+                _seekBar.Value = Math.Max(0, Math.Min(1, position / _duration));
+            UpdateTimeLabels(position, _duration);
         }
 
         private void OnMpvEvent(string eventName)
@@ -654,10 +815,11 @@ namespace LumaPlayer
 
         private void RefreshMediaStatus()
         {
-            if (_mpv == null)
+            MpvProcess mpv = _mpv;
+            if (mpv == null)
                 return;
 
-            _mpv.GetProperty("video-params", delegate(object value)
+            mpv.GetProperty("video-params", delegate(object value)
             {
                 IDictionary<string, object> parameters = value as IDictionary<string, object>;
                 string transfer = GetMapString(parameters, "gamma");
@@ -665,14 +827,14 @@ namespace LumaPlayer
                 string colorMatrix = GetMapString(parameters, "colormatrix");
                 bool isDolbyVision = String.Equals(colorMatrix, "dolbyvision", StringComparison.OrdinalIgnoreCase);
 
-                _mpv.GetProperty("video-target-params", delegate(object targetValue)
+                mpv.GetProperty("video-target-params", delegate(object targetValue)
                 {
                     IDictionary<string, object> target = targetValue as IDictionary<string, object>;
                     string targetTransfer = GetMapString(target, "gamma");
                     bool targetIsHdr = String.Equals(targetTransfer, "pq", StringComparison.OrdinalIgnoreCase) ||
                         String.Equals(targetTransfer, "hlg", StringComparison.OrdinalIgnoreCase);
 
-                    _mpv.GetProperty("video-codec", delegate(object codecValue)
+                    mpv.GetProperty("video-codec", delegate(object codecValue)
                     {
                         string codec = codecValue == null ? "" : Convert.ToString(codecValue, CultureInfo.InvariantCulture);
                         string picture;
@@ -685,16 +847,19 @@ namespace LumaPlayer
                         else
                             picture = "SDR";
 
-                        string hw = _statusLabel.Tag as string;
-                        List<string> parts = new List<string>();
-                        parts.Add(picture);
-                        if (!String.IsNullOrEmpty(primaries))
-                            parts.Add(primaries.ToUpperInvariant());
-                        if (!String.IsNullOrEmpty(codec))
-                            parts.Add(GetCompactCodecName(codec));
-                        if (!String.IsNullOrEmpty(hw))
-                            parts.Add(hw);
-                        _statusLabel.Text = String.Join("  ·  ", parts.ToArray());
+                        // These callbacks run on the IPC reader thread; touch controls only on the UI thread.
+                        SafeUi(delegate
+                        {
+                            List<string> parts = new List<string>();
+                            parts.Add(picture);
+                            if (!String.IsNullOrEmpty(primaries))
+                                parts.Add(primaries.ToUpperInvariant());
+                            if (!String.IsNullOrEmpty(codec))
+                                parts.Add(GetCompactCodecName(codec));
+                            if (!String.IsNullOrEmpty(_hwdec))
+                                parts.Add(_hwdec);
+                            _statusLabel.Text = String.Join("  ·  ", parts.ToArray());
+                        });
                     });
                 });
             });
@@ -1041,9 +1206,12 @@ namespace LumaPlayer
         {
             SafeUi(delegate
             {
+                if (_isFullscreen)
+                    ToggleFullscreen();
                 _hasFile = false;
                 _seekBar.Enabled = false;
                 SetPlaybackButtons(false);
+                _emptyState.Visible = true;
                 _statusLabel.Text = "播放引擎已停止";
                 if (!IsDisposed && !Disposing)
                     ShowError("播放引擎异常退出", message);
@@ -1074,9 +1242,15 @@ namespace LumaPlayer
             current = Math.Max(0, current);
             total = Math.Max(0, total);
             double remaining = Math.Max(0, total - current);
-            _elapsedLabel.Text = "已播放 " + FormatTime(current);
-            _remainingLabel.Text = "剩余 " + FormatTime(remaining);
-            _totalLabel.Text = "总时长 " + FormatTime(total);
+            SetTextIfChanged(_elapsedLabel, "已播放 " + FormatTime(current));
+            SetTextIfChanged(_remainingLabel, "剩余 " + FormatTime(remaining));
+            SetTextIfChanged(_totalLabel, "总时长 " + FormatTime(total));
+        }
+
+        private static void SetTextIfChanged(Control control, string text)
+        {
+            if (control.Text != text)
+                control.Text = text;
         }
 
         private static string FormatTime(double seconds)
@@ -1122,6 +1296,8 @@ namespace LumaPlayer
             }
             if (_mpv != null)
             {
+                SaveResumePosition();
+                DetachMpv(_mpv);
                 _mpv.Dispose();
                 _mpv = null;
             }
@@ -1193,6 +1369,9 @@ namespace LumaPlayer
         {
             string pipePath = "\\\\.\\pipe\\" + _pipeName;
             string inputConfig = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "input.conf");
+            string watchLaterDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LumaPlayer", "watch_later");
+            try { Directory.CreateDirectory(watchLaterDir); } catch { }
             string arguments = String.Join(" ", new string[]
             {
                 "--wid=" + _windowId.ToString(CultureInfo.InvariantCulture),
@@ -1217,7 +1396,13 @@ namespace LumaPlayer
                 "--audio-pitch-correction=yes",
                 "--sub-auto=fuzzy",
                 "--audio-file-auto=fuzzy",
-                "--osd-level=0"
+                "--osd-level=0",
+                // Resume where the user stopped. The host writes the resume point
+                // explicitly when switching files or closing; only the position and
+                // track choices are restored, not volume, speed or pause.
+                "--resume-playback=yes",
+                "--watch-later-dir=\"" + watchLaterDir + "\"",
+                "--watch-later-options=aid,sid,sub-delay,audio-delay"
             });
 
             ProcessStartInfo startInfo = new ProcessStartInfo();
@@ -1329,7 +1514,15 @@ namespace LumaPlayer
                     IDictionary<string, object> message = parsed as IDictionary<string, object>;
                     if (message == null)
                         continue;
-                    HandleMessage(message);
+                    try
+                    {
+                        HandleMessage(message);
+                    }
+                    catch (Exception ex)
+                    {
+                        // A failing UI handler must not be reported as an engine crash.
+                        Trace.WriteLine("Luma Player: " + ex);
+                    }
                 }
             }
             catch (Exception ex)
@@ -1840,6 +2033,7 @@ namespace LumaPlayer
         public event EventHandler ValueChanged;
         public event EventHandler SeekStarted;
         public event EventHandler SeekEnded;
+        public event EventHandler PreviewChanged;
 
         public double Value
         {
@@ -1849,9 +2043,18 @@ namespace LumaPlayer
                 double next = Math.Max(0, Math.Min(1, value));
                 if (Math.Abs(_value - next) < 0.0001)
                     return;
+                int before = FilledWidth(_value);
                 _value = next;
-                Invalidate();
+                // Repaint only when the thumb actually moves by a pixel.
+                if (FilledWidth(next) != before)
+                    Invalidate();
             }
+        }
+
+        private int FilledWidth(double value)
+        {
+            int usableWidth = Math.Max(1, ClientSize.Width - 7 * 2);
+            return (int)Math.Round(usableWidth * value);
         }
 
         public SeekBar()
@@ -1927,12 +2130,9 @@ namespace LumaPlayer
             int margin = 7;
             int usableWidth = Math.Max(1, ClientSize.Width - margin * 2);
             Value = (x - margin) / (double)usableWidth;
-            if (notify)
-            {
-                EventHandler changed = ValueChanged;
-                if (changed != null)
-                    changed(this, EventArgs.Empty);
-            }
+            EventHandler handler = notify ? ValueChanged : PreviewChanged;
+            if (handler != null)
+                handler(this, EventArgs.Empty);
         }
 
         private static GraphicsPath RoundedRect(Rectangle rectangle, int radius)
