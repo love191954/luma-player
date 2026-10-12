@@ -201,6 +201,14 @@ namespace LumaPlayer
         private int _openMenus;
         private bool _eofReached;
         private bool _fitWindowPending;
+        private int _subPos = 100;
+        private int _subScale = 100;
+        private readonly List<string> _pendingSubtitles = new List<string>();
+
+        private static readonly string[] SubtitleExtensions = new string[]
+        {
+            ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup", ".smi", ".sami", ".txt"
+        };
         private double _duration;
         private double _position;
         private double _speed = 1;
@@ -386,6 +394,8 @@ namespace LumaPlayer
             _volumeBar.Minimum = 0;
             _volumeBar.Maximum = 100;
             _volumeBar.Value = UserSettings.LoadVolume(80);
+            _subPos = UserSettings.LoadInt("SubtitlePosition", 100, 0, 150);
+            _subScale = UserSettings.LoadInt("SubtitleScale", 100, 50, 300);
             _volumeBar.BackColor = PanelColor;
             _volumeBar.Margin = new Padding(0, 6, 8, 0);
             _toolTip.SetToolTip(_volumeBar, "音量");
@@ -553,7 +563,7 @@ namespace LumaPlayer
             try
             {
                 uint windowId = unchecked((uint)_videoSurface.Handle.ToInt64());
-                _mpv = new MpvProcess(mpvPath, windowId, _volumeBar.Value);
+                _mpv = new MpvProcess(mpvPath, windowId, _volumeBar.Value, _subPos, _subScale);
                 _mpv.PropertyChanged += OnMpvPropertyChanged;
                 _mpv.EventReceived += OnMpvEvent;
                 _mpv.ClientMessageReceived += OnMpvClientMessage;
@@ -622,7 +632,7 @@ namespace LumaPlayer
         {
             string[] properties = new string[]
             {
-                "time-pos", "duration", "pause", "volume", "mute", "speed", "media-title", "hwdec-current", "eof-reached"
+                "time-pos", "duration", "pause", "volume", "mute", "speed", "media-title", "hwdec-current", "eof-reached", "sub-pos", "sub-scale"
             };
             for (int i = 0; i < properties.Length; i++)
                 _mpv.Observe(properties[i]);
@@ -790,6 +800,14 @@ namespace LumaPlayer
                 {
                     _eofReached = ToBool(value);
                 }
+                else if (name == "sub-pos" && value != null)
+                {
+                    _subPos = (int)Math.Round(ToDouble(value));
+                }
+                else if (name == "sub-scale" && value != null)
+                {
+                    _subScale = (int)Math.Round(ToDouble(value) * 100);
+                }
             });
         }
 
@@ -813,6 +831,7 @@ namespace LumaPlayer
                 {
                     _hasFile = true;
                     _emptyState.Visible = false;
+                    AddPendingSubtitles();
                     RefreshMediaStatus();
                 }
                 else if (eventName == "end-file")
@@ -1022,8 +1041,16 @@ namespace LumaPlayer
                         disable.Click += delegate { _mpv.SetProperty("sid", "no"); };
                         menu.Items.Add(disable);
                         ToolStripMenuItem external = new ToolStripMenuItem("加载外部字幕…");
+                        external.ToolTipText = "也可以把字幕文件直接拖进播放窗口";
                         external.Click += delegate { LoadExternalSubtitle(); };
                         menu.Items.Add(external);
+
+                        menu.Items.Add(new ToolStripSeparator());
+                        AddSubtitleStyleItem(menu, "字幕放大", "Ctrl+=", delegate { AdjustSubtitleScale(10); });
+                        AddSubtitleStyleItem(menu, "字幕缩小", "Ctrl+-", delegate { AdjustSubtitleScale(-10); });
+                        AddSubtitleStyleItem(menu, "字幕上移", "Ctrl+↑", delegate { AdjustSubtitlePosition(-2); });
+                        AddSubtitleStyleItem(menu, "字幕下移", "Ctrl+↓", delegate { AdjustSubtitlePosition(2); });
+                        AddSubtitleStyleItem(menu, "恢复默认大小和位置", "Ctrl+0", delegate { ResetSubtitleStyle(); });
                     }
 
                     menu.Show(anchor, new Point(0, anchor.Height));
@@ -1131,13 +1158,86 @@ namespace LumaPlayer
 
         private void LoadExternalSubtitle()
         {
+            if (_mpv == null || !_hasFile)
+                return;
             using (OpenFileDialog dialog = new OpenFileDialog())
             {
                 dialog.Title = "加载外部字幕";
-                dialog.Filter = "字幕文件|*.srt;*.ass;*.ssa;*.vtt;*.sub|所有文件|*.*";
+                dialog.Filter = "字幕文件|*.srt;*.ass;*.ssa;*.vtt;*.sub;*.idx;*.sup;*.smi;*.sami;*.txt|所有文件|*.*";
+                dialog.Multiselect = true;
                 if (dialog.ShowDialog(this) == DialogResult.OK)
-                    _mpv.Command("sub-add", dialog.FileName, "select");
+                    AddSubtitles(dialog.FileNames);
             }
+        }
+
+        private static bool IsSubtitleFile(string path)
+        {
+            string extension = Path.GetExtension(path);
+            for (int i = 0; i < SubtitleExtensions.Length; i++)
+            {
+                if (String.Equals(extension, SubtitleExtensions[i], StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        private void AddSubtitles(IList<string> paths)
+        {
+            if (_mpv == null || paths.Count == 0)
+                return;
+            // Select the last one added so the user immediately sees it.
+            for (int i = 0; i < paths.Count; i++)
+                _mpv.Command("sub-add", paths[i], i == paths.Count - 1 ? "select" : "auto");
+            _statusLabel.Text = paths.Count == 1
+                ? "已加载字幕：" + Path.GetFileName(paths[0])
+                : "已加载 " + paths.Count.ToString(CultureInfo.InvariantCulture) + " 个字幕文件";
+        }
+
+        private void AddPendingSubtitles()
+        {
+            if (_pendingSubtitles.Count == 0)
+                return;
+            List<string> subtitles = new List<string>(_pendingSubtitles);
+            _pendingSubtitles.Clear();
+            AddSubtitles(subtitles);
+        }
+
+        private void AddSubtitleStyleItem(ContextMenuStrip menu, string text, string shortcut, EventHandler onClick)
+        {
+            ToolStripMenuItem item = new ToolStripMenuItem(text);
+            item.ShortcutKeyDisplayString = shortcut;
+            item.Click += onClick;
+            menu.Items.Add(item);
+        }
+
+        // sub-pos is a percentage of the video height (100 = bottom edge, up to
+        // 150 to push below it); sub-scale is stored in percent.
+        private void AdjustSubtitlePosition(int delta)
+        {
+            _subPos = Math.Max(0, Math.Min(150, _subPos + delta));
+            if (_mpv != null && _mpv.IsRunning)
+                _mpv.SetProperty("sub-pos", _subPos);
+            _statusLabel.Text = "字幕位置：" + _subPos.ToString(CultureInfo.InvariantCulture) + "（默认 100，数值越大越靠下）";
+        }
+
+        private void AdjustSubtitleScale(int deltaPercent)
+        {
+            _subScale = Math.Max(50, Math.Min(300, _subScale + deltaPercent));
+            if (_mpv != null && _mpv.IsRunning)
+                _mpv.SetProperty("sub-scale", _subScale / 100.0);
+            _statusLabel.Text = "字幕大小：" + _subScale.ToString(CultureInfo.InvariantCulture) + "%";
+        }
+
+        private void ResetSubtitleStyle()
+        {
+            _subPos = 100;
+            _subScale = 100;
+            if (_mpv != null && _mpv.IsRunning)
+            {
+                _mpv.SetProperty("sub-pos", _subPos);
+                _mpv.SetProperty("sub-scale", 1.0);
+            }
+            _statusLabel.Text = "字幕已恢复默认大小和位置";
         }
 
         private void RegisterFileAssociations()
@@ -1311,6 +1411,26 @@ namespace LumaPlayer
                 OpenVideoInNewWindow();
                 return true;
             }
+            if (keyData == (Keys.Control | Keys.Up) || keyData == (Keys.Control | Keys.Down))
+            {
+                AdjustSubtitlePosition(keyData == (Keys.Control | Keys.Up) ? -2 : 2);
+                return true;
+            }
+            if (keyData == (Keys.Control | Keys.Oemplus) || keyData == (Keys.Control | Keys.Add))
+            {
+                AdjustSubtitleScale(10);
+                return true;
+            }
+            if (keyData == (Keys.Control | Keys.OemMinus) || keyData == (Keys.Control | Keys.Subtract))
+            {
+                AdjustSubtitleScale(-10);
+                return true;
+            }
+            if (keyData == (Keys.Control | Keys.D0) || keyData == (Keys.Control | Keys.NumPad0))
+            {
+                ResetSubtitleStyle();
+                return true;
+            }
             if (keyData == Keys.Space)
             {
                 TogglePause();
@@ -1358,8 +1478,31 @@ namespace LumaPlayer
         private void OnDragDrop(object sender, DragEventArgs e)
         {
             string[] files = e.Data == null ? null : e.Data.GetData(DataFormats.FileDrop) as string[];
-            if (files != null && files.Length > 0)
-                LoadFile(files[0]);
+            if (files == null || files.Length == 0)
+                return;
+
+            // A video and its subtitle files can be dropped together; subtitles
+            // dropped on their own are added to the video that is playing.
+            string video = null;
+            List<string> subtitles = new List<string>();
+            foreach (string file in files)
+            {
+                if (IsSubtitleFile(file))
+                    subtitles.Add(file);
+                else if (video == null)
+                    video = file;
+            }
+
+            if (video != null)
+            {
+                _pendingSubtitles.Clear();
+                _pendingSubtitles.AddRange(subtitles);
+                LoadFile(video);
+            }
+            else if (_hasFile)
+                AddSubtitles(subtitles);
+            else
+                _statusLabel.Text = "请先打开视频，再拖入字幕";
         }
 
         private void OnMpvFailed(string message)
@@ -1451,6 +1594,8 @@ namespace LumaPlayer
         {
             _fullscreenMouseTimer.Stop();
             UserSettings.SaveVolume(_volumeBar.Value);
+            UserSettings.SaveInt("SubtitlePosition", _subPos);
+            UserSettings.SaveInt("SubtitleScale", _subScale);
             if (_cursorHidden)
             {
                 Cursor.Show();
@@ -1505,6 +1650,31 @@ namespace LumaPlayer
             return fallback;
         }
 
+        public static int LoadInt(string name, int fallback, int minimum, int maximum)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(KeyPath))
+                {
+                    object value = key == null ? null : key.GetValue(name);
+                    if (value is int)
+                        return Math.Max(minimum, Math.Min(maximum, (int)value));
+                }
+            }
+            catch (Exception) { }
+            return fallback;
+        }
+
+        public static void SaveInt(string name, int value)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(KeyPath))
+                    key.SetValue(name, value, RegistryValueKind.DWord);
+            }
+            catch (Exception) { }
+        }
+
         public static bool LoadSingleWindow()
         {
             try
@@ -1546,6 +1716,8 @@ namespace LumaPlayer
         private readonly string _executable;
         private readonly uint _windowId;
         private readonly int _initialVolume;
+        private readonly int _subPos;
+        private readonly int _subScale;
         private readonly string _pipeName;
         private readonly JavaScriptSerializer _json;
         private readonly object _writeLock;
@@ -1571,9 +1743,11 @@ namespace LumaPlayer
             get { return _process != null && !_process.HasExited && _pipe != null && _pipe.IsConnected; }
         }
 
-        public MpvProcess(string executable, uint windowId, int initialVolume)
+        public MpvProcess(string executable, uint windowId, int initialVolume, int subPos, int subScale)
         {
             _initialVolume = initialVolume;
+            _subPos = subPos;
+            _subScale = subScale;
             _executable = executable;
             _windowId = windowId;
             _pipeName = "LumaPlayer-" + Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N");
@@ -1614,6 +1788,13 @@ namespace LumaPlayer
                 "--video-sync=display-resample",
                 "--audio-pitch-correction=yes",
                 "--sub-auto=fuzzy",
+                "--sub-file-paths=\"sub;subs;subtitles;Subs;Subtitles;字幕\"",
+                // Put subtitles into black bars when the picture has them (e.g. a
+                // wide film in full screen), for plain-text and ASS subtitles alike.
+                "--sub-use-margins=yes",
+                "--sub-ass-force-margins=yes",
+                "--sub-pos=" + _subPos.ToString(CultureInfo.InvariantCulture),
+                "--sub-scale=" + (_subScale / 100.0).ToString("0.##", CultureInfo.InvariantCulture),
                 "--audio-file-auto=fuzzy",
                 "--osd-level=0",
                 "--volume=" + _initialVolume.ToString(CultureInfo.InvariantCulture),
