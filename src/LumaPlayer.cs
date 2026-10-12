@@ -228,12 +228,23 @@ namespace LumaPlayer
             SuspendLayout();
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
             Text = "Luma Player";
-            Opacity = 0;
             BackColor = WindowColor;
             ForeColor = TextColor;
             ClientSize = new Size(1180, 720);
             MinimumSize = new Size(900, 520);
-            StartPosition = FormStartPosition.CenterScreen;
+            // The window is created off screen and moved into place once it is fully
+            // laid out (or, when opening a video, once the video is sized). This
+            // replaces the old Opacity = 0 trick: on Windows 11 a fully transparent
+            // layered window still flashed its thin border and shadow.
+            StartPosition = FormStartPosition.Manual;
+            Rectangle startWork = Screen.FromPoint(Cursor.Position).WorkingArea;
+            _revealBounds = new Rectangle(
+                startWork.Left + Math.Max(0, (startWork.Width - Width) / 2),
+                startWork.Top + Math.Max(0, (startWork.Height - Height) / 2),
+                Width, Height);
+            _revealPending = true;
+            Rectangle desktop = SystemInformation.VirtualScreen;
+            Location = new Point(desktop.Left - Width - 200, desktop.Top - Height - 200);
             KeyPreview = true;
             AllowDrop = true;
             Font = new Font("Segoe UI", 10F, FontStyle.Regular, GraphicsUnit.Point);
@@ -527,20 +538,20 @@ namespace LumaPlayer
             CenterEmptyState();
             if (!String.IsNullOrEmpty(_initialFile))
             {
-                // Opened by double-clicking a video: keep the window off screen until
-                // the video is sized, so the user never sees the empty logo page, the
-                // engine's black start-up frame or the window jumping to the video's
-                // aspect ratio. The timer is a fallback for files without video.
+                // Opened by double-clicking a video: stay off screen until the video
+                // is sized, so the user never sees the empty logo page, the engine's
+                // black start-up frame or the window jumping to the video's aspect
+                // ratio. The timer is a fallback for files without video.
                 _emptyState.Visible = false;
-                _revealPending = true;
-                _revealBounds = Bounds;
-                Location = new Point(-32000, -32000);
                 _revealTimer = new System.Windows.Forms.Timer();
                 _revealTimer.Interval = 2000;
                 _revealTimer.Tick += delegate { RevealWindow(); };
                 _revealTimer.Start();
             }
-            Opacity = 1;
+            else
+            {
+                RevealWindow();
+            }
             SingleInstance.Listen(OpenFromAnotherInstance);
             if (!String.IsNullOrEmpty(_initialFile))
                 BeginInvoke(new MethodInvoker(delegate { LoadFile(_initialFile); }));
