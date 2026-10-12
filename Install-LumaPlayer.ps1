@@ -21,10 +21,17 @@ $extensions = @(
     ".mts", ".mpg", ".mpeg", ".wmv", ".flv", ".ogv"
 )
 
+# Run from a source checkout after build.ps1: install the freshly built dist folder.
+$builtRoot = Join-Path $sourceRoot "dist"
+if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot "mpv.exe") -PathType Leaf) -and
+    (Test-Path -LiteralPath (Join-Path $builtRoot "mpv.exe") -PathType Leaf)) {
+    $sourceRoot = [System.IO.Path]::GetFullPath($builtRoot).TrimEnd('\')
+}
+
 foreach ($requiredFile in $requiredFiles) {
     $sourceFile = Join-Path $sourceRoot $requiredFile
     if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) {
-        throw "发布包缺少文件：$requiredFile"
+        throw "发布包缺少文件：$requiredFile。如果这是从 GitHub 下载的源代码，请先运行 build.ps1 编译，或者下载 Releases 页面里的 LumaPlayer-*-win-x64.zip 安装包。"
     }
 }
 
