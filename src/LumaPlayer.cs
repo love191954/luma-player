@@ -19,8 +19,8 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("A focused HDR video player for Windows")]
 [assembly: AssemblyCompany("Luma Player")]
 [assembly: AssemblyProduct("Luma Player")]
-[assembly: AssemblyVersion("0.4.0.0")]
-[assembly: AssemblyFileVersion("0.4.0.0")]
+[assembly: AssemblyVersion("0.4.2.0")]
+[assembly: AssemblyFileVersion("0.4.2.0")]
 
 namespace LumaPlayer
 {
@@ -185,6 +185,10 @@ namespace LumaPlayer
         private bool _isSeeking;
         private bool _isFullscreen;
         private bool _cursorHidden;
+        private readonly System.Windows.Forms.Timer _fullscreenMouseTimer;
+        private Point _lastCursorPosition;
+        private int _lastMouseMoveTick;
+        private int _openMenus;
         private bool _eofReached;
         private double _duration;
         private double _position;
@@ -340,6 +344,12 @@ namespace LumaPlayer
 
             _toolTip = new ToolTip();
 
+            // The video surface belongs to the mpv process, so the host never sees
+            // its mouse messages. Poll the cursor while full screen instead.
+            _fullscreenMouseTimer = new System.Windows.Forms.Timer();
+            _fullscreenMouseTimer.Interval = 150;
+            _fullscreenMouseTimer.Tick += OnFullscreenMouseTick;
+
             BufferedFlowLayoutPanel left = new BufferedFlowLayoutPanel();
             left.SuspendLayout();
             left.Dock = DockStyle.Fill;
@@ -361,7 +371,7 @@ namespace LumaPlayer
             _volumeBar.Height = 40;
             _volumeBar.Minimum = 0;
             _volumeBar.Maximum = 100;
-            _volumeBar.Value = 80;
+            _volumeBar.Value = UserSettings.LoadVolume(80);
             _volumeBar.BackColor = PanelColor;
             _volumeBar.Margin = new Padding(0, 6, 8, 0);
             _toolTip.SetToolTip(_volumeBar, "音量");
@@ -530,7 +540,7 @@ namespace LumaPlayer
             try
             {
                 uint windowId = unchecked((uint)_videoSurface.Handle.ToInt64());
-                _mpv = new MpvProcess(mpvPath, windowId);
+                _mpv = new MpvProcess(mpvPath, windowId, _volumeBar.Value);
                 _mpv.PropertyChanged += OnMpvPropertyChanged;
                 _mpv.EventReceived += OnMpvEvent;
                 _mpv.ClientMessageReceived += OnMpvClientMessage;
@@ -954,6 +964,8 @@ namespace LumaPlayer
         private ContextMenuStrip CreateDarkMenu()
         {
             ContextMenuStrip menu = new ContextMenuStrip();
+            menu.Opened += delegate { _openMenus++; };
+            menu.Closed += delegate { _openMenus = Math.Max(0, _openMenus - 1); };
             menu.BackColor = PanelColor;
             menu.ForeColor = TextColor;
             menu.Font = Font;
@@ -1109,10 +1121,13 @@ namespace LumaPlayer
                 _isFullscreen = true;
                 _fullScreenButton.Text = "退出全屏";
                 HideFullscreenControls();
+                _lastCursorPosition = Cursor.Position;
+                _fullscreenMouseTimer.Start();
             }
             else
             {
                 _isFullscreen = false;
+                _fullscreenMouseTimer.Stop();
                 ShowFullscreenControls();
                 TopMost = false;
                 FormBorderStyle = _restoreBorderStyle;
@@ -1131,6 +1146,29 @@ namespace LumaPlayer
                 Cursor.Show();
                 _cursorHidden = false;
             }
+        }
+
+        private void OnFullscreenMouseTick(object sender, EventArgs e)
+        {
+            if (!_isFullscreen)
+                return;
+
+            Point position = Cursor.Position;
+            if (position != _lastCursorPosition)
+            {
+                _lastCursorPosition = position;
+                _lastMouseMoveTick = Environment.TickCount;
+                ShowFullscreenControls();
+                return;
+            }
+
+            if (!_controls.Visible || _openMenus > 0)
+                return;
+            // Keep the bar while the pointer rests on it.
+            if (_controls.RectangleToScreen(_controls.ClientRectangle).Contains(position))
+                return;
+            if (unchecked(Environment.TickCount - _lastMouseMoveTick) >= 2500)
+                HideFullscreenControls();
         }
 
         private void HideFullscreenControls()
@@ -1289,6 +1327,8 @@ namespace LumaPlayer
 
         private void OnFormClosing(object sender, FormClosingEventArgs e)
         {
+            _fullscreenMouseTimer.Stop();
+            UserSettings.SaveVolume(_volumeBar.Value);
             if (_cursorHidden)
             {
                 Cursor.Show();
@@ -1324,10 +1364,41 @@ namespace LumaPlayer
         }
     }
 
+    internal static class UserSettings
+    {
+        private const string KeyPath = "Software\\LumaPlayer\\Settings";
+
+        public static int LoadVolume(int fallback)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(KeyPath))
+                {
+                    object value = key == null ? null : key.GetValue("Volume");
+                    if (value is int)
+                        return Math.Max(0, Math.Min(100, (int)value));
+                }
+            }
+            catch (Exception) { }
+            return fallback;
+        }
+
+        public static void SaveVolume(int volume)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(KeyPath))
+                    key.SetValue("Volume", volume, RegistryValueKind.DWord);
+            }
+            catch (Exception) { }
+        }
+    }
+
     internal sealed class MpvProcess : IDisposable
     {
         private readonly string _executable;
         private readonly uint _windowId;
+        private readonly int _initialVolume;
         private readonly string _pipeName;
         private readonly JavaScriptSerializer _json;
         private readonly object _writeLock;
@@ -1353,8 +1424,9 @@ namespace LumaPlayer
             get { return _process != null && !_process.HasExited && _pipe != null && _pipe.IsConnected; }
         }
 
-        public MpvProcess(string executable, uint windowId)
+        public MpvProcess(string executable, uint windowId, int initialVolume)
         {
+            _initialVolume = initialVolume;
             _executable = executable;
             _windowId = windowId;
             _pipeName = "LumaPlayer-" + Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N");
@@ -1397,6 +1469,7 @@ namespace LumaPlayer
                 "--sub-auto=fuzzy",
                 "--audio-file-auto=fuzzy",
                 "--osd-level=0",
+                "--volume=" + _initialVolume.ToString(CultureInfo.InvariantCulture),
                 // Resume where the user stopped. The host writes the resume point
                 // explicitly when switching files or closing; only the position and
                 // track choices are restored, not volume, speed or pause.
