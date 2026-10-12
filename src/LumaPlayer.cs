@@ -101,17 +101,19 @@ namespace LumaPlayer
         {
             try
             {
-                using (NamedPipeClientStream client = new NamedPipeClientStream(".", PipeName, PipeDirection.Out))
+                using (NamedPipeClientStream client = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut))
                 {
                     client.Connect(1500);
                     AllowSetForegroundWindow(AnyProcess);
-                    using (StreamWriter writer = new StreamWriter(client, new UTF8Encoding(false)))
-                    {
-                        writer.WriteLine(path ?? "");
-                        writer.Flush();
-                    }
+                    StreamWriter writer = new StreamWriter(client, new UTF8Encoding(false));
+                    StreamReader reader = new StreamReader(client, new UTF8Encoding(false));
+                    writer.WriteLine(path ?? "");
+                    writer.Flush();
+                    // The running window answers "ok" only if it will play the file.
+                    // A window that is closing says no, and this process opens its own.
+                    System.Threading.Tasks.Task<string> reply = reader.ReadLineAsync();
+                    return reply.Wait(3000) && reply.Result == "ok";
                 }
-                return true;
             }
             catch (Exception)
             {
@@ -119,7 +121,7 @@ namespace LumaPlayer
             }
         }
 
-        public static void Listen(Action<string> onOpen)
+        public static void Listen(Func<string, bool> onOpen)
         {
             Thread listener = new Thread(delegate()
             {
@@ -127,11 +129,15 @@ namespace LumaPlayer
                 {
                     try
                     {
-                        using (NamedPipeServerStream server = new NamedPipeServerStream(PipeName, PipeDirection.In, 1))
+                        using (NamedPipeServerStream server = new NamedPipeServerStream(PipeName, PipeDirection.InOut, 1))
                         {
                             server.WaitForConnection();
-                            using (StreamReader reader = new StreamReader(server, new UTF8Encoding(false)))
-                                onOpen(reader.ReadLine() ?? "");
+                            StreamReader reader = new StreamReader(server, new UTF8Encoding(false));
+                            StreamWriter writer = new StreamWriter(server, new UTF8Encoding(false));
+                            bool accepted = onOpen(reader.ReadLine() ?? "");
+                            writer.WriteLine(accepted ? "ok" : "no");
+                            writer.Flush();
+                            server.WaitForPipeDrain();
                         }
                     }
                     catch (IOException)
@@ -202,6 +208,12 @@ namespace LumaPlayer
         private bool _eofReached;
         private bool _fitWindowPending;
         private bool _revealPending;
+        private volatile bool _closing;
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+
+        private const int DwmwaTransitionsForceDisabled = 3;
         private Rectangle _revealBounds;
         private System.Windows.Forms.Timer _revealTimer;
         private int _subPos = 100;
@@ -557,6 +569,20 @@ namespace LumaPlayer
                 BeginInvoke(new MethodInvoker(delegate { LoadFile(_initialFile); }));
         }
 
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            // Turn off the Windows open/close zoom animation for this window. It
+            // briefly draws an empty, growing or shrinking frame around the video
+            // area, which reads as a small rectangle flashing on screen.
+            try
+            {
+                int disabled = 1;
+                DwmSetWindowAttribute(Handle, DwmwaTransitionsForceDisabled, ref disabled, sizeof(int));
+            }
+            catch (Exception) { }
+        }
+
         private void RevealWindow()
         {
             if (!_revealPending)
@@ -572,8 +598,10 @@ namespace LumaPlayer
             Activate();
         }
 
-        private void OpenFromAnotherInstance(string path)
+        private bool OpenFromAnotherInstance(string path)
         {
+            if (_closing || IsDisposed || !IsHandleCreated)
+                return false;
             SafeUi(delegate
             {
                 if (WindowState == FormWindowState.Minimized)
@@ -582,6 +610,7 @@ namespace LumaPlayer
                 if (!String.IsNullOrEmpty(path) && File.Exists(path))
                     LoadFile(Path.GetFullPath(path));
             });
+            return true;
         }
 
         private bool EnsureMpv()
@@ -1655,6 +1684,7 @@ namespace LumaPlayer
 
         private void OnFormClosing(object sender, FormClosingEventArgs e)
         {
+            _closing = true;
             _fullscreenMouseTimer.Stop();
             UserSettings.SaveVolume(_volumeBar.Value);
             UserSettings.SaveInt("SubtitlePosition", _subPos);
