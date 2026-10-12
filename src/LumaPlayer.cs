@@ -275,7 +275,11 @@ namespace LumaPlayer
             _controls.Height = 116;
             _controls.Padding = new Padding(18, 10, 18, 10);
             Controls.Add(_controls);
-            _controls.BringToFront();
+            // WinForms docks from the back of the z-order forward. The Fill video
+            // surface must be in front so it only gets the space above the control
+            // bar; otherwise it spans the whole window and the bar hides the bottom
+            // of the picture.
+            _videoSurface.BringToFront();
 
             BufferedTableLayoutPanel controlLayout = new BufferedTableLayoutPanel();
             controlLayout.SuspendLayout();
