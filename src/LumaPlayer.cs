@@ -200,6 +200,7 @@ namespace LumaPlayer
         private int _lastMouseMoveTick;
         private int _openMenus;
         private bool _eofReached;
+        private bool _fitWindowPending;
         private double _duration;
         private double _position;
         private double _speed = 1;
@@ -660,6 +661,7 @@ namespace LumaPlayer
             _hasFile = true;
             _isPaused = false;
             _eofReached = false;
+            _fitWindowPending = true;
             _duration = 0;
             _position = 0;
             _seekBar.Value = 0;
@@ -854,6 +856,10 @@ namespace LumaPlayer
                 string primaries = GetMapString(parameters, "primaries");
                 string colorMatrix = GetMapString(parameters, "colormatrix");
                 bool isDolbyVision = String.Equals(colorMatrix, "dolbyvision", StringComparison.OrdinalIgnoreCase);
+                double displayWidth = ToDouble(parameters != null && parameters.ContainsKey("dw") ? parameters["dw"] : null);
+                double displayHeight = ToDouble(parameters != null && parameters.ContainsKey("dh") ? parameters["dh"] : null);
+                if (displayWidth > 0 && displayHeight > 0)
+                    SafeUi(delegate { FitWindowToVideo(displayWidth, displayHeight); });
 
                 mpv.GetProperty("video-target-params", delegate(object targetValue)
                 {
@@ -891,6 +897,52 @@ namespace LumaPlayer
                     });
                 });
             });
+        }
+
+        // Once per opened file, size the window to the video's aspect ratio so the
+        // picture fills the video area without black bars. Keeps the current
+        // video width where possible and stays inside the screen's work area.
+        private void FitWindowToVideo(double videoWidth, double videoHeight)
+        {
+            if (!_fitWindowPending)
+                return;
+            _fitWindowPending = false;
+            if (_isFullscreen || WindowState != FormWindowState.Normal)
+                return;
+
+            Size area = _videoSurface.ClientSize;
+            if (area.Width <= 0 || area.Height <= 0)
+                return;
+            int extraWidth = Width - area.Width;
+            int extraHeight = Height - area.Height;
+            Rectangle work = Screen.FromControl(this).WorkingArea;
+            double aspect = videoWidth / videoHeight;
+
+            double width = area.Width;
+            double height = width / aspect;
+            double maxWidth = work.Width - extraWidth;
+            double maxHeight = work.Height - extraHeight;
+            if (height > maxHeight)
+            {
+                height = maxHeight;
+                width = height * aspect;
+            }
+            if (width > maxWidth)
+            {
+                width = maxWidth;
+                height = width / aspect;
+            }
+
+            Size size = new Size(
+                Math.Max(MinimumSize.Width, (int)Math.Round(width) + extraWidth),
+                Math.Max(MinimumSize.Height, (int)Math.Round(height) + extraHeight));
+            if (size == Size)
+                return;
+
+            Point center = new Point(Left + Width / 2, Top + Height / 2);
+            int left = Math.Max(work.Left, Math.Min(work.Right - size.Width, center.X - size.Width / 2));
+            int top = Math.Max(work.Top, Math.Min(work.Bottom - size.Height, center.Y - size.Height / 2));
+            Bounds = new Rectangle(left, top, size.Width, size.Height);
         }
 
         private static string GetMapString(IDictionary<string, object> map, string key)
