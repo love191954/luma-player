@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $false)]
     [string]$Destination = (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "dist"),
 
