@@ -67,12 +67,15 @@ function Set-LumaRegistryValue {
 $progId = "LumaPlayer.Video"
 $applicationName = "Luma Player"
 $openCommand = '"' + $installExe + '" "%1"'
+$newWindowCommand = '"' + $installExe + '" --new-window "%1"'
 $iconValue = '"' + $installExe + '",0'
 $shortcutIconLocation = $installExe + ",0"
 
 Set-LumaRegistryValue "Software\Classes\$progId" "" "Luma Player 视频"
 Set-LumaRegistryValue "Software\Classes\$progId\DefaultIcon" "" $iconValue
 Set-LumaRegistryValue "Software\Classes\$progId\shell\open\command" "" $openCommand
+Set-LumaRegistryValue "Software\Classes\$progId\shell\openNewWindow" "" "在新窗口中播放"
+Set-LumaRegistryValue "Software\Classes\$progId\shell\openNewWindow\command" "" $newWindowCommand
 Set-LumaRegistryValue "Software\Classes\Applications\LumaPlayer.exe" "FriendlyAppName" $applicationName
 Set-LumaRegistryValue "Software\Classes\Applications\LumaPlayer.exe\shell\open\command" "" $openCommand
 Set-LumaRegistryValue "Software\LumaPlayer\Capabilities" "ApplicationName" $applicationName

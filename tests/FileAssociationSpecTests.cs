@@ -13,6 +13,8 @@ namespace LumaPlayerTests
                 "\"C:\\Apps\\Luma Player\\LumaPlayer.exe\" \"%1\"", "open command quoting");
             Assert(LumaPlayer.FileAssociationSpec.BuildIconValue("C:\\Apps\\Luma Player\\LumaPlayer.exe") ==
                 "\"C:\\Apps\\Luma Player\\LumaPlayer.exe\",0", "icon value quoting");
+            Assert(LumaPlayer.FileAssociationSpec.BuildNewWindowCommand("C:\\Apps\\Luma Player\\LumaPlayer.exe") ==
+                "\"C:\\Apps\\Luma Player\\LumaPlayer.exe\" --new-window \"%1\"", "new window command quoting");
 
             for (int i = 0; i < LumaPlayer.FileAssociationSpec.Extensions.Length; i++)
             {

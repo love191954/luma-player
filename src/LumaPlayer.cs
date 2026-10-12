@@ -46,17 +46,27 @@ namespace LumaPlayer
             Application.SetCompatibleTextRenderingDefault(false);
 
             string initialFile = null;
-            if (args != null && args.Length > 0 && File.Exists(args[0]))
-                initialFile = Path.GetFullPath(args[0]);
-
-            // Double-clicking another video should reuse the open window
-            // instead of starting a second player that plays on top of it.
-            bool isPrimary;
-            using (Mutex instanceMutex = new Mutex(false, SingleInstance.MutexName, out isPrimary))
+            bool newWindow = false;
+            if (args != null)
             {
-                if (!isPrimary && SingleInstance.TrySendToPrimary(initialFile))
+                foreach (string arg in args)
+                {
+                    if (String.Equals(arg, FileAssociationSpec.NewWindowArgument, StringComparison.OrdinalIgnoreCase))
+                        newWindow = true;
+                    else if (initialFile == null && File.Exists(arg))
+                        initialFile = Path.GetFullPath(arg);
+                }
+            }
+
+            // In single-window mode, double-clicking another video reuses the open
+            // window. "--new-window" (or turning the mode off) always opens a new one.
+            bool isFirstInstance;
+            using (Mutex instanceMutex = new Mutex(false, SingleInstance.MutexName, out isFirstInstance))
+            {
+                if (!isFirstInstance && !newWindow && UserSettings.LoadSingleWindow() &&
+                    SingleInstance.TrySendToPrimary(initialFile))
                     return;
-                Application.Run(new PlayerForm(initialFile, isPrimary));
+                Application.Run(new PlayerForm(initialFile));
             }
         }
     }
@@ -126,7 +136,8 @@ namespace LumaPlayer
                     }
                     catch (IOException)
                     {
-                        Thread.Sleep(200);
+                        // Another Luma window already owns the pipe; take over once it closes.
+                        Thread.Sleep(1000);
                     }
                     catch (Exception)
                     {
@@ -151,7 +162,6 @@ namespace LumaPlayer
         private static extern void SHChangeNotify(uint eventId, uint flags, IntPtr item1, IntPtr item2);
 
         private readonly string _initialFile;
-        private readonly bool _isPrimaryInstance;
         private readonly Panel _videoSurface;
         private readonly Panel _emptyState;
         private readonly LumaMark _emptyMark;
@@ -172,7 +182,7 @@ namespace LumaPlayer
         private readonly Button _audioButton;
         private readonly Button _subtitleButton;
         private readonly Button _speedButton;
-        private readonly Button _associateButton;
+        private readonly Button _settingsButton;
         private readonly Button _fullScreenButton;
         private readonly ToolTip _toolTip;
 
@@ -200,10 +210,9 @@ namespace LumaPlayer
         private FormBorderStyle _restoreBorderStyle;
         private FormWindowState _restoreWindowState;
 
-        public PlayerForm(string initialFile, bool isPrimaryInstance)
+        public PlayerForm(string initialFile)
         {
             _initialFile = initialFile;
-            _isPrimaryInstance = isPrimaryInstance;
             SuspendLayout();
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
             Text = "Luma Player";
@@ -405,12 +414,12 @@ namespace LumaPlayer
             _audioButton = CreateTextButton("音轨", 52);
             _subtitleButton = CreateTextButton("字幕", 52);
             _speedButton = CreateTextButton("倍速 1×", 68);
-            _associateButton = CreateTextButton("关联格式", 76);
-            _toolTip.SetToolTip(_associateButton, "设置双击视频文件时使用 Luma Player 打开");
+            _settingsButton = CreateTextButton("设置", 76);
+            _toolTip.SetToolTip(_settingsButton, "窗口模式、新窗口打开和格式关联");
             right.Controls.Add(_speedButton);
             right.Controls.Add(_audioButton);
             right.Controls.Add(_subtitleButton);
-            right.Controls.Add(_associateButton);
+            right.Controls.Add(_settingsButton);
             right.Controls.Add(_fullScreenButton);
 
             _statusLabel = new Label();
@@ -431,7 +440,7 @@ namespace LumaPlayer
             _muteButton.Click += delegate { ToggleMute(); };
             _fullScreenButton.Click += delegate { ToggleFullscreen(); };
             _speedButton.Click += delegate { ShowSpeedMenu(); };
-            _associateButton.Click += delegate { RegisterFileAssociations(); };
+            _settingsButton.Click += delegate { ShowSettingsMenu(); };
             _audioButton.Click += delegate { ShowTrackMenu(_audioButton, "audio"); };
             _subtitleButton.Click += delegate { ShowTrackMenu(_subtitleButton, "sub"); };
             _volumeBar.ValueChanged += OnVolumeChanged;
@@ -499,8 +508,7 @@ namespace LumaPlayer
             PerformLayout();
             CenterEmptyState();
             Opacity = 1;
-            if (_isPrimaryInstance)
-                SingleInstance.Listen(OpenFromAnotherInstance);
+            SingleInstance.Listen(OpenFromAnotherInstance);
             if (!String.IsNullOrEmpty(_initialFile))
                 BeginInvoke(new MethodInvoker(delegate { LoadFile(_initialFile); }));
         }
@@ -617,14 +625,20 @@ namespace LumaPlayer
 
         private void OpenVideoDialog()
         {
+            string path = PickVideoFile();
+            if (path != null)
+                LoadFile(path);
+        }
+
+        private string PickVideoFile()
+        {
             using (OpenFileDialog dialog = new OpenFileDialog())
             {
                 dialog.Title = "打开视频";
                 dialog.Filter = "视频文件|*.mkv;*.mp4;*.m4v;*.mov;*.avi;*.webm;*.ts;*.m2ts;*.mts;*.mpg;*.mpeg;*.wmv;*.flv;*.ogv|所有文件|*.*";
                 dialog.Multiselect = false;
                 dialog.CheckFileExists = true;
-                if (dialog.ShowDialog(this) == DialogResult.OK)
-                    LoadFile(dialog.FileName);
+                return dialog.ShowDialog(this) == DialogResult.OK ? dialog.FileName : null;
             }
         }
 
@@ -974,6 +988,47 @@ namespace LumaPlayer
             return menu;
         }
 
+        private void ShowSettingsMenu()
+        {
+            ContextMenuStrip menu = CreateDarkMenu();
+
+            ToolStripMenuItem singleWindow = new ToolStripMenuItem("只用一个窗口播放");
+            singleWindow.Checked = UserSettings.LoadSingleWindow();
+            singleWindow.ToolTipText = "开启后，双击其他视频会在当前窗口切换播放";
+            singleWindow.Click += delegate { UserSettings.SaveSingleWindow(!UserSettings.LoadSingleWindow()); };
+            menu.Items.Add(singleWindow);
+
+            ToolStripMenuItem newWindow = new ToolStripMenuItem("在新窗口打开视频…    Ctrl+N");
+            newWindow.Click += delegate { OpenVideoInNewWindow(); };
+            menu.Items.Add(newWindow);
+
+            menu.Items.Add(new ToolStripSeparator());
+            ToolStripMenuItem associate = new ToolStripMenuItem("关联视频格式…");
+            associate.Click += delegate { RegisterFileAssociations(); };
+            menu.Items.Add(associate);
+
+            Size preferred = menu.GetPreferredSize(Size.Empty);
+            menu.Show(_settingsButton, new Point(_settingsButton.Width - preferred.Width, -preferred.Height));
+        }
+
+        private void OpenVideoInNewWindow()
+        {
+            string path = PickVideoFile();
+            if (path == null)
+                return;
+            try
+            {
+                Process.Start(new ProcessStartInfo(
+                    Application.ExecutablePath,
+                    FileAssociationSpec.NewWindowArgument + " \"" + path + "\""
+                ) { UseShellExecute = false });
+            }
+            catch (Exception ex)
+            {
+                ShowError("无法打开新窗口", ex.Message);
+            }
+        }
+
         private void ShowSpeedMenu()
         {
             if (_mpv == null || !_hasFile)
@@ -1046,6 +1101,12 @@ namespace LumaPlayer
                         icon.SetValue("", FileAssociationSpec.BuildIconValue(executable));
                     using (RegistryKey open = prog.CreateSubKey("shell\\open\\command"))
                         open.SetValue("", command);
+                    using (RegistryKey newWindow = prog.CreateSubKey("shell\\" + FileAssociationSpec.NewWindowVerb))
+                    {
+                        newWindow.SetValue("", FileAssociationSpec.NewWindowVerbLabel);
+                        using (RegistryKey newWindowCommand = newWindow.CreateSubKey("command"))
+                            newWindowCommand.SetValue("", FileAssociationSpec.BuildNewWindowCommand(executable));
+                    }
                 }
 
                 using (RegistryKey application = Registry.CurrentUser.CreateSubKey("Software\\Classes\\Applications\\LumaPlayer.exe"))
@@ -1187,6 +1248,11 @@ namespace LumaPlayer
             if (keyData == (Keys.Control | Keys.O))
             {
                 OpenVideoDialog();
+                return true;
+            }
+            if (keyData == (Keys.Control | Keys.N))
+            {
+                OpenVideoInNewWindow();
                 return true;
             }
             if (keyData == Keys.Space)
@@ -1381,6 +1447,31 @@ namespace LumaPlayer
             }
             catch (Exception) { }
             return fallback;
+        }
+
+        public static bool LoadSingleWindow()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(KeyPath))
+                {
+                    object value = key == null ? null : key.GetValue("SingleWindow");
+                    if (value is int)
+                        return (int)value != 0;
+                }
+            }
+            catch (Exception) { }
+            return true;
+        }
+
+        public static void SaveSingleWindow(bool enabled)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(KeyPath))
+                    key.SetValue("SingleWindow", enabled ? 1 : 0, RegistryValueKind.DWord);
+            }
+            catch (Exception) { }
         }
 
         public static void SaveVolume(int volume)
