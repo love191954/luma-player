@@ -201,6 +201,9 @@ namespace LumaPlayer
         private int _openMenus;
         private bool _eofReached;
         private bool _fitWindowPending;
+        private bool _revealPending;
+        private Rectangle _revealBounds;
+        private System.Windows.Forms.Timer _revealTimer;
         private int _subPos = 100;
         private int _subScale = 100;
         private readonly List<string> _pendingSubtitles = new List<string>();
@@ -522,10 +525,40 @@ namespace LumaPlayer
         {
             PerformLayout();
             CenterEmptyState();
+            if (!String.IsNullOrEmpty(_initialFile))
+            {
+                // Opened by double-clicking a video: keep the window off screen until
+                // the video is sized, so the user never sees the empty logo page, the
+                // engine's black start-up frame or the window jumping to the video's
+                // aspect ratio. The timer is a fallback for files without video.
+                _emptyState.Visible = false;
+                _revealPending = true;
+                _revealBounds = Bounds;
+                Location = new Point(-32000, -32000);
+                _revealTimer = new System.Windows.Forms.Timer();
+                _revealTimer.Interval = 2000;
+                _revealTimer.Tick += delegate { RevealWindow(); };
+                _revealTimer.Start();
+            }
             Opacity = 1;
             SingleInstance.Listen(OpenFromAnotherInstance);
             if (!String.IsNullOrEmpty(_initialFile))
                 BeginInvoke(new MethodInvoker(delegate { LoadFile(_initialFile); }));
+        }
+
+        private void RevealWindow()
+        {
+            if (!_revealPending)
+                return;
+            _revealPending = false;
+            if (_revealTimer != null)
+            {
+                _revealTimer.Stop();
+                _revealTimer.Dispose();
+                _revealTimer = null;
+            }
+            Bounds = _revealBounds;
+            Activate();
         }
 
         private void OpenFromAnotherInstance(string path)
@@ -926,15 +959,29 @@ namespace LumaPlayer
             if (!_fitWindowPending)
                 return;
             _fitWindowPending = false;
+            try
+            {
+                ApplyVideoAspect(videoWidth, videoHeight);
+            }
+            finally
+            {
+                RevealWindow();
+            }
+        }
+
+        private void ApplyVideoAspect(double videoWidth, double videoHeight)
+        {
             if (_isFullscreen || WindowState != FormWindowState.Normal)
                 return;
+            // While the window waits off screen, size it around where it will appear.
+            Rectangle current = _revealPending ? _revealBounds : Bounds;
 
             Size area = _videoSurface.ClientSize;
             if (area.Width <= 0 || area.Height <= 0)
                 return;
             int extraWidth = Width - area.Width;
             int extraHeight = Height - area.Height;
-            Rectangle work = Screen.FromControl(this).WorkingArea;
+            Rectangle work = Screen.FromRectangle(current).WorkingArea;
             double aspect = videoWidth / videoHeight;
 
             double width = area.Width;
@@ -955,13 +1002,17 @@ namespace LumaPlayer
             Size size = new Size(
                 Math.Max(MinimumSize.Width, (int)Math.Round(width) + extraWidth),
                 Math.Max(MinimumSize.Height, (int)Math.Round(height) + extraHeight));
-            if (size == Size)
+            if (size == current.Size)
                 return;
 
-            Point center = new Point(Left + Width / 2, Top + Height / 2);
+            Point center = new Point(current.Left + current.Width / 2, current.Top + current.Height / 2);
             int left = Math.Max(work.Left, Math.Min(work.Right - size.Width, center.X - size.Width / 2));
             int top = Math.Max(work.Top, Math.Min(work.Bottom - size.Height, center.Y - size.Height / 2));
-            Bounds = new Rectangle(left, top, size.Width, size.Height);
+            Rectangle target = new Rectangle(left, top, size.Width, size.Height);
+            if (_revealPending)
+                _revealBounds = target;
+            else
+                Bounds = target;
         }
 
         private static string GetMapString(IDictionary<string, object> map, string key)
@@ -1531,6 +1582,7 @@ namespace LumaPlayer
 
         private void ShowError(string title, string details)
         {
+            RevealWindow();
             MessageBox.Show(this, details, title, MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
 
