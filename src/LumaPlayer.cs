@@ -19,8 +19,8 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("A focused HDR video player for Windows")]
 [assembly: AssemblyCompany("Luma Player")]
 [assembly: AssemblyProduct("Luma Player")]
-[assembly: AssemblyVersion("0.4.0.0")]
-[assembly: AssemblyFileVersion("0.4.0.0")]
+[assembly: AssemblyVersion("0.4.2.0")]
+[assembly: AssemblyFileVersion("0.4.2.0")]
 
 namespace LumaPlayer
 {
@@ -46,10 +46,114 @@ namespace LumaPlayer
             Application.SetCompatibleTextRenderingDefault(false);
 
             string initialFile = null;
-            if (args != null && args.Length > 0 && File.Exists(args[0]))
-                initialFile = Path.GetFullPath(args[0]);
+            bool newWindow = false;
+            if (args != null)
+            {
+                foreach (string arg in args)
+                {
+                    if (String.Equals(arg, FileAssociationSpec.NewWindowArgument, StringComparison.OrdinalIgnoreCase))
+                        newWindow = true;
+                    else if (initialFile == null && File.Exists(arg))
+                        initialFile = Path.GetFullPath(arg);
+                }
+            }
 
-            Application.Run(new PlayerForm(initialFile));
+            // In single-window mode, double-clicking another video reuses the open
+            // window. "--new-window" (or turning the mode off) always opens a new one.
+            bool isFirstInstance;
+            using (Mutex instanceMutex = new Mutex(false, SingleInstance.MutexName, out isFirstInstance))
+            {
+                if (!isFirstInstance && !newWindow && UserSettings.LoadSingleWindow() &&
+                    SingleInstance.TrySendToPrimary(initialFile))
+                    return;
+                Application.Run(new PlayerForm(initialFile));
+            }
+        }
+    }
+
+    internal static class SingleInstance
+    {
+        [DllImport("user32.dll")]
+        private static extern bool AllowSetForegroundWindow(int processId);
+
+        private const int AnyProcess = -1;
+        private static readonly string InstanceKey = BuildInstanceKey();
+
+        public static string MutexName
+        {
+            get { return "Local\\LumaPlayer-" + InstanceKey; }
+        }
+
+        private static string PipeName
+        {
+            get { return "LumaPlayer-Open-" + InstanceKey; }
+        }
+
+        private static string BuildInstanceKey()
+        {
+            string user;
+            try { user = System.Security.Principal.WindowsIdentity.GetCurrent().User.Value; }
+            catch { user = Environment.UserName; }
+            return user + "-" + Process.GetCurrentProcess().SessionId.ToString(CultureInfo.InvariantCulture);
+        }
+
+        public static bool TrySendToPrimary(string path)
+        {
+            try
+            {
+                using (NamedPipeClientStream client = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut))
+                {
+                    client.Connect(1500);
+                    AllowSetForegroundWindow(AnyProcess);
+                    StreamWriter writer = new StreamWriter(client, new UTF8Encoding(false));
+                    StreamReader reader = new StreamReader(client, new UTF8Encoding(false));
+                    writer.WriteLine(path ?? "");
+                    writer.Flush();
+                    // The running window answers "ok" only if it will play the file.
+                    // A window that is closing says no, and this process opens its own.
+                    System.Threading.Tasks.Task<string> reply = reader.ReadLineAsync();
+                    return reply.Wait(3000) && reply.Result == "ok";
+                }
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        public static void Listen(Func<string, bool> onOpen)
+        {
+            Thread listener = new Thread(delegate()
+            {
+                while (true)
+                {
+                    try
+                    {
+                        using (NamedPipeServerStream server = new NamedPipeServerStream(PipeName, PipeDirection.InOut, 1))
+                        {
+                            server.WaitForConnection();
+                            StreamReader reader = new StreamReader(server, new UTF8Encoding(false));
+                            StreamWriter writer = new StreamWriter(server, new UTF8Encoding(false));
+                            bool accepted = onOpen(reader.ReadLine() ?? "");
+                            writer.WriteLine(accepted ? "ok" : "no");
+                            writer.Flush();
+                            server.WaitForPipeDrain();
+                        }
+                    }
+                    catch (IOException)
+                    {
+                        // Another Luma window already owns the pipe; take over once it closes.
+                        Thread.Sleep(1000);
+                    }
+                    catch (Exception)
+                    {
+                        return;
+                    }
+                }
+            });
+            listener.IsBackground = true;
+            listener.Name = "LumaPlayer single instance";
+            listener.Start();
         }
     }
 
@@ -84,7 +188,7 @@ namespace LumaPlayer
         private readonly Button _audioButton;
         private readonly Button _subtitleButton;
         private readonly Button _speedButton;
-        private readonly Button _associateButton;
+        private readonly Button _settingsButton;
         private readonly Button _fullScreenButton;
         private readonly ToolTip _toolTip;
 
@@ -97,9 +201,35 @@ namespace LumaPlayer
         private bool _isSeeking;
         private bool _isFullscreen;
         private bool _cursorHidden;
+        private readonly System.Windows.Forms.Timer _fullscreenMouseTimer;
+        private Point _lastCursorPosition;
+        private int _lastMouseMoveTick;
+        private int _openMenus;
+        private bool _eofReached;
+        private bool _fitWindowPending;
+        private bool _revealPending;
+        private volatile bool _closing;
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+
+        private const int DwmwaTransitionsForceDisabled = 3;
+        private Rectangle _revealBounds;
+        private System.Windows.Forms.Timer _revealTimer;
+        private int _subPos = 100;
+        private int _subScale = 100;
+        private readonly List<string> _pendingSubtitles = new List<string>();
+
+        private static readonly string[] SubtitleExtensions = new string[]
+        {
+            ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup", ".smi", ".sami", ".txt"
+        };
         private double _duration;
         private double _position;
         private double _speed = 1;
+        private string _hwdec;
+        private double _pendingPosition;
+        private int _positionUpdateQueued;
         private Rectangle _restoreBounds;
         private FormBorderStyle _restoreBorderStyle;
         private FormWindowState _restoreWindowState;
@@ -110,12 +240,23 @@ namespace LumaPlayer
             SuspendLayout();
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
             Text = "Luma Player";
-            Opacity = 0;
             BackColor = WindowColor;
             ForeColor = TextColor;
             ClientSize = new Size(1180, 720);
             MinimumSize = new Size(900, 520);
-            StartPosition = FormStartPosition.CenterScreen;
+            // The window is created off screen and moved into place once it is fully
+            // laid out (or, when opening a video, once the video is sized). This
+            // replaces the old Opacity = 0 trick: on Windows 11 a fully transparent
+            // layered window still flashed its thin border and shadow.
+            StartPosition = FormStartPosition.Manual;
+            Rectangle startWork = Screen.FromPoint(Cursor.Position).WorkingArea;
+            _revealBounds = new Rectangle(
+                startWork.Left + Math.Max(0, (startWork.Width - Width) / 2),
+                startWork.Top + Math.Max(0, (startWork.Height - Height) / 2),
+                Width, Height);
+            _revealPending = true;
+            Rectangle desktop = SystemInformation.VirtualScreen;
+            Location = new Point(desktop.Left - Width - 200, desktop.Top - Height - 200);
             KeyPreview = true;
             AllowDrop = true;
             Font = new Font("Segoe UI", 10F, FontStyle.Regular, GraphicsUnit.Point);
@@ -169,7 +310,11 @@ namespace LumaPlayer
             _controls.Height = 116;
             _controls.Padding = new Padding(18, 10, 18, 10);
             Controls.Add(_controls);
-            _controls.BringToFront();
+            // WinForms docks from the back of the z-order forward. The Fill video
+            // surface must be in front so it only gets the space above the control
+            // bar; otherwise it spans the whole window and the bar hides the bottom
+            // of the picture.
+            _videoSurface.BringToFront();
 
             BufferedTableLayoutPanel controlLayout = new BufferedTableLayoutPanel();
             controlLayout.SuspendLayout();
@@ -224,6 +369,11 @@ namespace LumaPlayer
             _seekBar.ValueChanged += OnSeekRequested;
             _seekBar.SeekStarted += delegate { _isSeeking = true; };
             _seekBar.SeekEnded += delegate { _isSeeking = false; };
+            _seekBar.PreviewChanged += delegate
+            {
+                if (_duration > 0)
+                    UpdateTimeLabels(_duration * _seekBar.Value, _duration);
+            };
             timeline.Controls.Add(_seekBar, 0, 0);
 
             BufferedTableLayoutPanel row = new BufferedTableLayoutPanel();
@@ -241,6 +391,12 @@ namespace LumaPlayer
             controlLayout.Controls.Add(row, 0, 1);
 
             _toolTip = new ToolTip();
+
+            // The video surface belongs to the mpv process, so the host never sees
+            // its mouse messages. Poll the cursor while full screen instead.
+            _fullscreenMouseTimer = new System.Windows.Forms.Timer();
+            _fullscreenMouseTimer.Interval = 150;
+            _fullscreenMouseTimer.Tick += OnFullscreenMouseTick;
 
             BufferedFlowLayoutPanel left = new BufferedFlowLayoutPanel();
             left.SuspendLayout();
@@ -263,7 +419,9 @@ namespace LumaPlayer
             _volumeBar.Height = 40;
             _volumeBar.Minimum = 0;
             _volumeBar.Maximum = 100;
-            _volumeBar.Value = 80;
+            _volumeBar.Value = UserSettings.LoadVolume(80);
+            _subPos = UserSettings.LoadInt("SubtitlePosition", 100, 0, 150);
+            _subScale = UserSettings.LoadInt("SubtitleScale", 100, 50, 300);
             _volumeBar.BackColor = PanelColor;
             _volumeBar.Margin = new Padding(0, 6, 8, 0);
             _toolTip.SetToolTip(_volumeBar, "音量");
@@ -297,12 +455,12 @@ namespace LumaPlayer
             _audioButton = CreateTextButton("音轨", 52);
             _subtitleButton = CreateTextButton("字幕", 52);
             _speedButton = CreateTextButton("倍速 1×", 68);
-            _associateButton = CreateTextButton("关联格式", 76);
-            _toolTip.SetToolTip(_associateButton, "设置双击视频文件时使用 Luma Player 打开");
+            _settingsButton = CreateTextButton("设置", 76);
+            _toolTip.SetToolTip(_settingsButton, "窗口模式、新窗口打开和格式关联");
             right.Controls.Add(_speedButton);
             right.Controls.Add(_audioButton);
             right.Controls.Add(_subtitleButton);
-            right.Controls.Add(_associateButton);
+            right.Controls.Add(_settingsButton);
             right.Controls.Add(_fullScreenButton);
 
             _statusLabel = new Label();
@@ -323,7 +481,7 @@ namespace LumaPlayer
             _muteButton.Click += delegate { ToggleMute(); };
             _fullScreenButton.Click += delegate { ToggleFullscreen(); };
             _speedButton.Click += delegate { ShowSpeedMenu(); };
-            _associateButton.Click += delegate { RegisterFileAssociations(); };
+            _settingsButton.Click += delegate { ShowSettingsMenu(); };
             _audioButton.Click += delegate { ShowTrackMenu(_audioButton, "audio"); };
             _subtitleButton.Click += delegate { ShowTrackMenu(_subtitleButton, "sub"); };
             _volumeBar.ValueChanged += OnVolumeChanged;
@@ -390,15 +548,83 @@ namespace LumaPlayer
         {
             PerformLayout();
             CenterEmptyState();
-            Opacity = 1;
+            if (!String.IsNullOrEmpty(_initialFile))
+            {
+                // Opened by double-clicking a video: stay off screen until the video
+                // is sized, so the user never sees the empty logo page, the engine's
+                // black start-up frame or the window jumping to the video's aspect
+                // ratio. The timer is a fallback for files without video.
+                _emptyState.Visible = false;
+                _revealTimer = new System.Windows.Forms.Timer();
+                _revealTimer.Interval = 2000;
+                _revealTimer.Tick += delegate { RevealWindow(); };
+                _revealTimer.Start();
+            }
+            else
+            {
+                RevealWindow();
+            }
+            SingleInstance.Listen(OpenFromAnotherInstance);
             if (!String.IsNullOrEmpty(_initialFile))
                 BeginInvoke(new MethodInvoker(delegate { LoadFile(_initialFile); }));
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            // Turn off the Windows open/close zoom animation for this window. It
+            // briefly draws an empty, growing or shrinking frame around the video
+            // area, which reads as a small rectangle flashing on screen.
+            try
+            {
+                int disabled = 1;
+                DwmSetWindowAttribute(Handle, DwmwaTransitionsForceDisabled, ref disabled, sizeof(int));
+            }
+            catch (Exception) { }
+        }
+
+        private void RevealWindow()
+        {
+            if (!_revealPending)
+                return;
+            _revealPending = false;
+            if (_revealTimer != null)
+            {
+                _revealTimer.Stop();
+                _revealTimer.Dispose();
+                _revealTimer = null;
+            }
+            Bounds = _revealBounds;
+            Activate();
+        }
+
+        private bool OpenFromAnotherInstance(string path)
+        {
+            if (_closing || IsDisposed || !IsHandleCreated)
+                return false;
+            SafeUi(delegate
+            {
+                if (WindowState == FormWindowState.Minimized)
+                    WindowState = FormWindowState.Normal;
+                Activate();
+                if (!String.IsNullOrEmpty(path) && File.Exists(path))
+                    LoadFile(Path.GetFullPath(path));
+            });
+            return true;
         }
 
         private bool EnsureMpv()
         {
             if (_mpv != null && _mpv.IsRunning)
                 return true;
+
+            if (_mpv != null)
+            {
+                // The previous engine crashed; release it before starting a new one.
+                DetachMpv(_mpv);
+                _mpv.Dispose();
+                _mpv = null;
+            }
 
             string mpvPath = FindMpv();
             if (mpvPath == null)
@@ -410,7 +636,7 @@ namespace LumaPlayer
             try
             {
                 uint windowId = unchecked((uint)_videoSurface.Handle.ToInt64());
-                _mpv = new MpvProcess(mpvPath, windowId);
+                _mpv = new MpvProcess(mpvPath, windowId, _volumeBar.Value, _subPos, _subScale);
                 _mpv.PropertyChanged += OnMpvPropertyChanged;
                 _mpv.EventReceived += OnMpvEvent;
                 _mpv.ClientMessageReceived += OnMpvClientMessage;
@@ -423,11 +649,31 @@ namespace LumaPlayer
             catch (Exception ex)
             {
                 if (_mpv != null)
+                {
+                    DetachMpv(_mpv);
                     _mpv.Dispose();
+                }
                 _mpv = null;
                 ShowError("播放器核心启动失败", ex.Message);
                 return false;
             }
+        }
+
+        private void DetachMpv(MpvProcess mpv)
+        {
+            mpv.PropertyChanged -= OnMpvPropertyChanged;
+            mpv.EventReceived -= OnMpvEvent;
+            mpv.ClientMessageReceived -= OnMpvClientMessage;
+            mpv.EngineFailed -= OnMpvFailed;
+        }
+
+        private void SaveResumePosition()
+        {
+            if (!_hasFile || _mpv == null || !_mpv.IsRunning)
+                return;
+            // Finished videos start from the beginning next time.
+            bool finished = _eofReached || (_duration > 0 && _position >= _duration - 5);
+            _mpv.Command(finished ? "delete-watch-later-config" : "write-watch-later-config");
         }
 
         private string FindMpv()
@@ -459,7 +705,7 @@ namespace LumaPlayer
         {
             string[] properties = new string[]
             {
-                "time-pos", "duration", "pause", "volume", "mute", "speed", "media-title", "hwdec-current"
+                "time-pos", "duration", "pause", "volume", "mute", "speed", "media-title", "hwdec-current", "eof-reached", "sub-pos", "sub-scale"
             };
             for (int i = 0; i < properties.Length; i++)
                 _mpv.Observe(properties[i]);
@@ -467,14 +713,20 @@ namespace LumaPlayer
 
         private void OpenVideoDialog()
         {
+            string path = PickVideoFile();
+            if (path != null)
+                LoadFile(path);
+        }
+
+        private string PickVideoFile()
+        {
             using (OpenFileDialog dialog = new OpenFileDialog())
             {
                 dialog.Title = "打开视频";
                 dialog.Filter = "视频文件|*.mkv;*.mp4;*.m4v;*.mov;*.avi;*.webm;*.ts;*.m2ts;*.mts;*.mpg;*.mpeg;*.wmv;*.flv;*.ogv|所有文件|*.*";
                 dialog.Multiselect = false;
                 dialog.CheckFileExists = true;
-                if (dialog.ShowDialog(this) == DialogResult.OK)
-                    LoadFile(dialog.FileName);
+                return dialog.ShowDialog(this) == DialogResult.OK ? dialog.FileName : null;
             }
         }
 
@@ -488,8 +740,11 @@ namespace LumaPlayer
             if (!EnsureMpv())
                 return;
 
+            SaveResumePosition();
             _hasFile = true;
             _isPaused = false;
+            _eofReached = false;
+            _fitWindowPending = true;
             _duration = 0;
             _position = 0;
             _seekBar.Value = 0;
@@ -557,17 +812,20 @@ namespace LumaPlayer
 
         private void OnMpvPropertyChanged(string name, object value)
         {
+            if (name == "time-pos")
+            {
+                // mpv reports time-pos about once per frame. Keep only the latest
+                // value and queue at most one UI update so the window thread never
+                // falls behind during high frame rate playback.
+                Interlocked.Exchange(ref _pendingPosition, ToDouble(value));
+                if (Interlocked.Exchange(ref _positionUpdateQueued, 1) == 0)
+                    SafeUi(ApplyPendingPosition);
+                return;
+            }
+
             SafeUi(delegate
             {
-                if (name == "time-pos")
-                {
-                    double position = ToDouble(value);
-                    _position = position;
-                    if (!_isSeeking && _duration > 0)
-                        _seekBar.Value = Math.Max(0, Math.Min(1, position / _duration));
-                    UpdateTimeLabels(position, _duration);
-                }
-                else if (name == "duration")
+                if (name == "duration")
                 {
                     _duration = ToDouble(value);
                     UpdateTimeLabels(_position, _duration);
@@ -606,12 +864,36 @@ namespace LumaPlayer
                     string hw = Convert.ToString(value, CultureInfo.InvariantCulture);
                     if (!String.IsNullOrEmpty(hw) && hw != "no")
                     {
-                        _statusLabel.Tag = hw.ToUpperInvariant();
+                        _hwdec = hw.ToUpperInvariant();
                         if (_hasFile)
                             RefreshMediaStatus();
                     }
                 }
+                else if (name == "eof-reached")
+                {
+                    _eofReached = ToBool(value);
+                }
+                else if (name == "sub-pos" && value != null)
+                {
+                    _subPos = (int)Math.Round(ToDouble(value));
+                }
+                else if (name == "sub-scale" && value != null)
+                {
+                    _subScale = (int)Math.Round(ToDouble(value) * 100);
+                }
             });
+        }
+
+        private void ApplyPendingPosition()
+        {
+            Interlocked.Exchange(ref _positionUpdateQueued, 0);
+            double position = Interlocked.CompareExchange(ref _pendingPosition, 0, 0);
+            _position = position;
+            if (_isSeeking)
+                return;
+            if (_duration > 0)
+                _seekBar.Value = Math.Max(0, Math.Min(1, position / _duration));
+            UpdateTimeLabels(position, _duration);
         }
 
         private void OnMpvEvent(string eventName)
@@ -622,6 +904,7 @@ namespace LumaPlayer
                 {
                     _hasFile = true;
                     _emptyState.Visible = false;
+                    AddPendingSubtitles();
                     RefreshMediaStatus();
                 }
                 else if (eventName == "end-file")
@@ -654,25 +937,30 @@ namespace LumaPlayer
 
         private void RefreshMediaStatus()
         {
-            if (_mpv == null)
+            MpvProcess mpv = _mpv;
+            if (mpv == null)
                 return;
 
-            _mpv.GetProperty("video-params", delegate(object value)
+            mpv.GetProperty("video-params", delegate(object value)
             {
                 IDictionary<string, object> parameters = value as IDictionary<string, object>;
                 string transfer = GetMapString(parameters, "gamma");
                 string primaries = GetMapString(parameters, "primaries");
                 string colorMatrix = GetMapString(parameters, "colormatrix");
                 bool isDolbyVision = String.Equals(colorMatrix, "dolbyvision", StringComparison.OrdinalIgnoreCase);
+                double displayWidth = ToDouble(parameters != null && parameters.ContainsKey("dw") ? parameters["dw"] : null);
+                double displayHeight = ToDouble(parameters != null && parameters.ContainsKey("dh") ? parameters["dh"] : null);
+                if (displayWidth > 0 && displayHeight > 0)
+                    SafeUi(delegate { FitWindowToVideo(displayWidth, displayHeight); });
 
-                _mpv.GetProperty("video-target-params", delegate(object targetValue)
+                mpv.GetProperty("video-target-params", delegate(object targetValue)
                 {
                     IDictionary<string, object> target = targetValue as IDictionary<string, object>;
                     string targetTransfer = GetMapString(target, "gamma");
                     bool targetIsHdr = String.Equals(targetTransfer, "pq", StringComparison.OrdinalIgnoreCase) ||
                         String.Equals(targetTransfer, "hlg", StringComparison.OrdinalIgnoreCase);
 
-                    _mpv.GetProperty("video-codec", delegate(object codecValue)
+                    mpv.GetProperty("video-codec", delegate(object codecValue)
                     {
                         string codec = codecValue == null ? "" : Convert.ToString(codecValue, CultureInfo.InvariantCulture);
                         string picture;
@@ -685,19 +973,86 @@ namespace LumaPlayer
                         else
                             picture = "SDR";
 
-                        string hw = _statusLabel.Tag as string;
-                        List<string> parts = new List<string>();
-                        parts.Add(picture);
-                        if (!String.IsNullOrEmpty(primaries))
-                            parts.Add(primaries.ToUpperInvariant());
-                        if (!String.IsNullOrEmpty(codec))
-                            parts.Add(GetCompactCodecName(codec));
-                        if (!String.IsNullOrEmpty(hw))
-                            parts.Add(hw);
-                        _statusLabel.Text = String.Join("  ·  ", parts.ToArray());
+                        // These callbacks run on the IPC reader thread; touch controls only on the UI thread.
+                        SafeUi(delegate
+                        {
+                            List<string> parts = new List<string>();
+                            parts.Add(picture);
+                            if (!String.IsNullOrEmpty(primaries))
+                                parts.Add(primaries.ToUpperInvariant());
+                            if (!String.IsNullOrEmpty(codec))
+                                parts.Add(GetCompactCodecName(codec));
+                            if (!String.IsNullOrEmpty(_hwdec))
+                                parts.Add(_hwdec);
+                            _statusLabel.Text = String.Join("  ·  ", parts.ToArray());
+                        });
                     });
                 });
             });
+        }
+
+        // Once per opened file, size the window to the video's aspect ratio so the
+        // picture fills the video area without black bars. Keeps the current
+        // video width where possible and stays inside the screen's work area.
+        private void FitWindowToVideo(double videoWidth, double videoHeight)
+        {
+            if (!_fitWindowPending)
+                return;
+            _fitWindowPending = false;
+            try
+            {
+                ApplyVideoAspect(videoWidth, videoHeight);
+            }
+            finally
+            {
+                RevealWindow();
+            }
+        }
+
+        private void ApplyVideoAspect(double videoWidth, double videoHeight)
+        {
+            if (_isFullscreen || WindowState != FormWindowState.Normal)
+                return;
+            // While the window waits off screen, size it around where it will appear.
+            Rectangle current = _revealPending ? _revealBounds : Bounds;
+
+            Size area = _videoSurface.ClientSize;
+            if (area.Width <= 0 || area.Height <= 0)
+                return;
+            int extraWidth = Width - area.Width;
+            int extraHeight = Height - area.Height;
+            Rectangle work = Screen.FromRectangle(current).WorkingArea;
+            double aspect = videoWidth / videoHeight;
+
+            double width = area.Width;
+            double height = width / aspect;
+            double maxWidth = work.Width - extraWidth;
+            double maxHeight = work.Height - extraHeight;
+            if (height > maxHeight)
+            {
+                height = maxHeight;
+                width = height * aspect;
+            }
+            if (width > maxWidth)
+            {
+                width = maxWidth;
+                height = width / aspect;
+            }
+
+            Size size = new Size(
+                Math.Max(MinimumSize.Width, (int)Math.Round(width) + extraWidth),
+                Math.Max(MinimumSize.Height, (int)Math.Round(height) + extraHeight));
+            if (size == current.Size)
+                return;
+
+            Point center = new Point(current.Left + current.Width / 2, current.Top + current.Height / 2);
+            int left = Math.Max(work.Left, Math.Min(work.Right - size.Width, center.X - size.Width / 2));
+            int top = Math.Max(work.Top, Math.Min(work.Bottom - size.Height, center.Y - size.Height / 2));
+            Rectangle target = new Rectangle(left, top, size.Width, size.Height);
+            if (_revealPending)
+                _revealBounds = target;
+            else
+                Bounds = target;
         }
 
         private static string GetMapString(IDictionary<string, object> map, string key)
@@ -777,8 +1132,16 @@ namespace LumaPlayer
                         disable.Click += delegate { _mpv.SetProperty("sid", "no"); };
                         menu.Items.Add(disable);
                         ToolStripMenuItem external = new ToolStripMenuItem("加载外部字幕…");
+                        external.ToolTipText = "也可以把字幕文件直接拖进播放窗口";
                         external.Click += delegate { LoadExternalSubtitle(); };
                         menu.Items.Add(external);
+
+                        menu.Items.Add(new ToolStripSeparator());
+                        AddSubtitleStyleItem(menu, "字幕放大", "Ctrl+=", delegate { AdjustSubtitleScale(10); });
+                        AddSubtitleStyleItem(menu, "字幕缩小", "Ctrl+-", delegate { AdjustSubtitleScale(-10); });
+                        AddSubtitleStyleItem(menu, "字幕上移", "Ctrl+↑", delegate { AdjustSubtitlePosition(-2); });
+                        AddSubtitleStyleItem(menu, "字幕下移", "Ctrl+↓", delegate { AdjustSubtitlePosition(2); });
+                        AddSubtitleStyleItem(menu, "恢复默认大小和位置", "Ctrl+0", delegate { ResetSubtitleStyle(); });
                     }
 
                     menu.Show(anchor, new Point(0, anchor.Height));
@@ -789,12 +1152,55 @@ namespace LumaPlayer
         private ContextMenuStrip CreateDarkMenu()
         {
             ContextMenuStrip menu = new ContextMenuStrip();
+            menu.Opened += delegate { _openMenus++; };
+            menu.Closed += delegate { _openMenus = Math.Max(0, _openMenus - 1); };
             menu.BackColor = PanelColor;
             menu.ForeColor = TextColor;
             menu.Font = Font;
             menu.ShowImageMargin = false;
             menu.Renderer = new ToolStripProfessionalRenderer(new DarkColorTable());
             return menu;
+        }
+
+        private void ShowSettingsMenu()
+        {
+            ContextMenuStrip menu = CreateDarkMenu();
+
+            ToolStripMenuItem singleWindow = new ToolStripMenuItem("只用一个窗口播放");
+            singleWindow.Checked = UserSettings.LoadSingleWindow();
+            singleWindow.ToolTipText = "开启后，双击其他视频会在当前窗口切换播放";
+            singleWindow.Click += delegate { UserSettings.SaveSingleWindow(!UserSettings.LoadSingleWindow()); };
+            menu.Items.Add(singleWindow);
+
+            ToolStripMenuItem newWindow = new ToolStripMenuItem("在新窗口打开视频…    Ctrl+N");
+            newWindow.Click += delegate { OpenVideoInNewWindow(); };
+            menu.Items.Add(newWindow);
+
+            menu.Items.Add(new ToolStripSeparator());
+            ToolStripMenuItem associate = new ToolStripMenuItem("关联视频格式…");
+            associate.Click += delegate { RegisterFileAssociations(); };
+            menu.Items.Add(associate);
+
+            Size preferred = menu.GetPreferredSize(Size.Empty);
+            menu.Show(_settingsButton, new Point(_settingsButton.Width - preferred.Width, -preferred.Height));
+        }
+
+        private void OpenVideoInNewWindow()
+        {
+            string path = PickVideoFile();
+            if (path == null)
+                return;
+            try
+            {
+                Process.Start(new ProcessStartInfo(
+                    Application.ExecutablePath,
+                    FileAssociationSpec.NewWindowArgument + " \"" + path + "\""
+                ) { UseShellExecute = false });
+            }
+            catch (Exception ex)
+            {
+                ShowError("无法打开新窗口", ex.Message);
+            }
         }
 
         private void ShowSpeedMenu()
@@ -843,13 +1249,86 @@ namespace LumaPlayer
 
         private void LoadExternalSubtitle()
         {
+            if (_mpv == null || !_hasFile)
+                return;
             using (OpenFileDialog dialog = new OpenFileDialog())
             {
                 dialog.Title = "加载外部字幕";
-                dialog.Filter = "字幕文件|*.srt;*.ass;*.ssa;*.vtt;*.sub|所有文件|*.*";
+                dialog.Filter = "字幕文件|*.srt;*.ass;*.ssa;*.vtt;*.sub;*.idx;*.sup;*.smi;*.sami;*.txt|所有文件|*.*";
+                dialog.Multiselect = true;
                 if (dialog.ShowDialog(this) == DialogResult.OK)
-                    _mpv.Command("sub-add", dialog.FileName, "select");
+                    AddSubtitles(dialog.FileNames);
             }
+        }
+
+        private static bool IsSubtitleFile(string path)
+        {
+            string extension = Path.GetExtension(path);
+            for (int i = 0; i < SubtitleExtensions.Length; i++)
+            {
+                if (String.Equals(extension, SubtitleExtensions[i], StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        private void AddSubtitles(IList<string> paths)
+        {
+            if (_mpv == null || paths.Count == 0)
+                return;
+            // Select the last one added so the user immediately sees it.
+            for (int i = 0; i < paths.Count; i++)
+                _mpv.Command("sub-add", paths[i], i == paths.Count - 1 ? "select" : "auto");
+            _statusLabel.Text = paths.Count == 1
+                ? "已加载字幕：" + Path.GetFileName(paths[0])
+                : "已加载 " + paths.Count.ToString(CultureInfo.InvariantCulture) + " 个字幕文件";
+        }
+
+        private void AddPendingSubtitles()
+        {
+            if (_pendingSubtitles.Count == 0)
+                return;
+            List<string> subtitles = new List<string>(_pendingSubtitles);
+            _pendingSubtitles.Clear();
+            AddSubtitles(subtitles);
+        }
+
+        private void AddSubtitleStyleItem(ContextMenuStrip menu, string text, string shortcut, EventHandler onClick)
+        {
+            ToolStripMenuItem item = new ToolStripMenuItem(text);
+            item.ShortcutKeyDisplayString = shortcut;
+            item.Click += onClick;
+            menu.Items.Add(item);
+        }
+
+        // sub-pos is a percentage of the video height (100 = bottom edge, up to
+        // 150 to push below it); sub-scale is stored in percent.
+        private void AdjustSubtitlePosition(int delta)
+        {
+            _subPos = Math.Max(0, Math.Min(150, _subPos + delta));
+            if (_mpv != null && _mpv.IsRunning)
+                _mpv.SetProperty("sub-pos", _subPos);
+            _statusLabel.Text = "字幕位置：" + _subPos.ToString(CultureInfo.InvariantCulture) + "（默认 100，数值越大越靠下）";
+        }
+
+        private void AdjustSubtitleScale(int deltaPercent)
+        {
+            _subScale = Math.Max(50, Math.Min(300, _subScale + deltaPercent));
+            if (_mpv != null && _mpv.IsRunning)
+                _mpv.SetProperty("sub-scale", _subScale / 100.0);
+            _statusLabel.Text = "字幕大小：" + _subScale.ToString(CultureInfo.InvariantCulture) + "%";
+        }
+
+        private void ResetSubtitleStyle()
+        {
+            _subPos = 100;
+            _subScale = 100;
+            if (_mpv != null && _mpv.IsRunning)
+            {
+                _mpv.SetProperty("sub-pos", _subPos);
+                _mpv.SetProperty("sub-scale", 1.0);
+            }
+            _statusLabel.Text = "字幕已恢复默认大小和位置";
         }
 
         private void RegisterFileAssociations()
@@ -869,6 +1348,12 @@ namespace LumaPlayer
                         icon.SetValue("", FileAssociationSpec.BuildIconValue(executable));
                     using (RegistryKey open = prog.CreateSubKey("shell\\open\\command"))
                         open.SetValue("", command);
+                    using (RegistryKey newWindow = prog.CreateSubKey("shell\\" + FileAssociationSpec.NewWindowVerb))
+                    {
+                        newWindow.SetValue("", FileAssociationSpec.NewWindowVerbLabel);
+                        using (RegistryKey newWindowCommand = newWindow.CreateSubKey("command"))
+                            newWindowCommand.SetValue("", FileAssociationSpec.BuildNewWindowCommand(executable));
+                    }
                 }
 
                 using (RegistryKey application = Registry.CurrentUser.CreateSubKey("Software\\Classes\\Applications\\LumaPlayer.exe"))
@@ -944,10 +1429,13 @@ namespace LumaPlayer
                 _isFullscreen = true;
                 _fullScreenButton.Text = "退出全屏";
                 HideFullscreenControls();
+                _lastCursorPosition = Cursor.Position;
+                _fullscreenMouseTimer.Start();
             }
             else
             {
                 _isFullscreen = false;
+                _fullscreenMouseTimer.Stop();
                 ShowFullscreenControls();
                 TopMost = false;
                 FormBorderStyle = _restoreBorderStyle;
@@ -968,6 +1456,29 @@ namespace LumaPlayer
             }
         }
 
+        private void OnFullscreenMouseTick(object sender, EventArgs e)
+        {
+            if (!_isFullscreen)
+                return;
+
+            Point position = Cursor.Position;
+            if (position != _lastCursorPosition)
+            {
+                _lastCursorPosition = position;
+                _lastMouseMoveTick = Environment.TickCount;
+                ShowFullscreenControls();
+                return;
+            }
+
+            if (!_controls.Visible || _openMenus > 0)
+                return;
+            // Keep the bar while the pointer rests on it.
+            if (_controls.RectangleToScreen(_controls.ClientRectangle).Contains(position))
+                return;
+            if (unchecked(Environment.TickCount - _lastMouseMoveTick) >= 2500)
+                HideFullscreenControls();
+        }
+
         private void HideFullscreenControls()
         {
             if (_controls.Visible)
@@ -984,6 +1495,31 @@ namespace LumaPlayer
             if (keyData == (Keys.Control | Keys.O))
             {
                 OpenVideoDialog();
+                return true;
+            }
+            if (keyData == (Keys.Control | Keys.N))
+            {
+                OpenVideoInNewWindow();
+                return true;
+            }
+            if (keyData == (Keys.Control | Keys.Up) || keyData == (Keys.Control | Keys.Down))
+            {
+                AdjustSubtitlePosition(keyData == (Keys.Control | Keys.Up) ? -2 : 2);
+                return true;
+            }
+            if (keyData == (Keys.Control | Keys.Oemplus) || keyData == (Keys.Control | Keys.Add))
+            {
+                AdjustSubtitleScale(10);
+                return true;
+            }
+            if (keyData == (Keys.Control | Keys.OemMinus) || keyData == (Keys.Control | Keys.Subtract))
+            {
+                AdjustSubtitleScale(-10);
+                return true;
+            }
+            if (keyData == (Keys.Control | Keys.D0) || keyData == (Keys.Control | Keys.NumPad0))
+            {
+                ResetSubtitleStyle();
                 return true;
             }
             if (keyData == Keys.Space)
@@ -1033,17 +1569,43 @@ namespace LumaPlayer
         private void OnDragDrop(object sender, DragEventArgs e)
         {
             string[] files = e.Data == null ? null : e.Data.GetData(DataFormats.FileDrop) as string[];
-            if (files != null && files.Length > 0)
-                LoadFile(files[0]);
+            if (files == null || files.Length == 0)
+                return;
+
+            // A video and its subtitle files can be dropped together; subtitles
+            // dropped on their own are added to the video that is playing.
+            string video = null;
+            List<string> subtitles = new List<string>();
+            foreach (string file in files)
+            {
+                if (IsSubtitleFile(file))
+                    subtitles.Add(file);
+                else if (video == null)
+                    video = file;
+            }
+
+            if (video != null)
+            {
+                _pendingSubtitles.Clear();
+                _pendingSubtitles.AddRange(subtitles);
+                LoadFile(video);
+            }
+            else if (_hasFile)
+                AddSubtitles(subtitles);
+            else
+                _statusLabel.Text = "请先打开视频，再拖入字幕";
         }
 
         private void OnMpvFailed(string message)
         {
             SafeUi(delegate
             {
+                if (_isFullscreen)
+                    ToggleFullscreen();
                 _hasFile = false;
                 _seekBar.Enabled = false;
                 SetPlaybackButtons(false);
+                _emptyState.Visible = true;
                 _statusLabel.Text = "播放引擎已停止";
                 if (!IsDisposed && !Disposing)
                     ShowError("播放引擎异常退出", message);
@@ -1060,6 +1622,7 @@ namespace LumaPlayer
 
         private void ShowError(string title, string details)
         {
+            RevealWindow();
             MessageBox.Show(this, details, title, MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
 
@@ -1074,9 +1637,15 @@ namespace LumaPlayer
             current = Math.Max(0, current);
             total = Math.Max(0, total);
             double remaining = Math.Max(0, total - current);
-            _elapsedLabel.Text = "已播放 " + FormatTime(current);
-            _remainingLabel.Text = "剩余 " + FormatTime(remaining);
-            _totalLabel.Text = "总时长 " + FormatTime(total);
+            SetTextIfChanged(_elapsedLabel, "已播放 " + FormatTime(current));
+            SetTextIfChanged(_remainingLabel, "剩余 " + FormatTime(remaining));
+            SetTextIfChanged(_totalLabel, "总时长 " + FormatTime(total));
+        }
+
+        private static void SetTextIfChanged(Control control, string text)
+        {
+            if (control.Text != text)
+                control.Text = text;
         }
 
         private static string FormatTime(double seconds)
@@ -1115,6 +1684,11 @@ namespace LumaPlayer
 
         private void OnFormClosing(object sender, FormClosingEventArgs e)
         {
+            _closing = true;
+            _fullscreenMouseTimer.Stop();
+            UserSettings.SaveVolume(_volumeBar.Value);
+            UserSettings.SaveInt("SubtitlePosition", _subPos);
+            UserSettings.SaveInt("SubtitleScale", _subScale);
             if (_cursorHidden)
             {
                 Cursor.Show();
@@ -1122,6 +1696,8 @@ namespace LumaPlayer
             }
             if (_mpv != null)
             {
+                SaveResumePosition();
+                DetachMpv(_mpv);
                 _mpv.Dispose();
                 _mpv = null;
             }
@@ -1148,10 +1724,93 @@ namespace LumaPlayer
         }
     }
 
+    internal static class UserSettings
+    {
+        private const string KeyPath = "Software\\LumaPlayer\\Settings";
+
+        public static int LoadVolume(int fallback)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(KeyPath))
+                {
+                    object value = key == null ? null : key.GetValue("Volume");
+                    if (value is int)
+                        return Math.Max(0, Math.Min(100, (int)value));
+                }
+            }
+            catch (Exception) { }
+            return fallback;
+        }
+
+        public static int LoadInt(string name, int fallback, int minimum, int maximum)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(KeyPath))
+                {
+                    object value = key == null ? null : key.GetValue(name);
+                    if (value is int)
+                        return Math.Max(minimum, Math.Min(maximum, (int)value));
+                }
+            }
+            catch (Exception) { }
+            return fallback;
+        }
+
+        public static void SaveInt(string name, int value)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(KeyPath))
+                    key.SetValue(name, value, RegistryValueKind.DWord);
+            }
+            catch (Exception) { }
+        }
+
+        public static bool LoadSingleWindow()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(KeyPath))
+                {
+                    object value = key == null ? null : key.GetValue("SingleWindow");
+                    if (value is int)
+                        return (int)value != 0;
+                }
+            }
+            catch (Exception) { }
+            return true;
+        }
+
+        public static void SaveSingleWindow(bool enabled)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(KeyPath))
+                    key.SetValue("SingleWindow", enabled ? 1 : 0, RegistryValueKind.DWord);
+            }
+            catch (Exception) { }
+        }
+
+        public static void SaveVolume(int volume)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(KeyPath))
+                    key.SetValue("Volume", volume, RegistryValueKind.DWord);
+            }
+            catch (Exception) { }
+        }
+    }
+
     internal sealed class MpvProcess : IDisposable
     {
         private readonly string _executable;
         private readonly uint _windowId;
+        private readonly int _initialVolume;
+        private readonly int _subPos;
+        private readonly int _subScale;
         private readonly string _pipeName;
         private readonly JavaScriptSerializer _json;
         private readonly object _writeLock;
@@ -1177,8 +1836,11 @@ namespace LumaPlayer
             get { return _process != null && !_process.HasExited && _pipe != null && _pipe.IsConnected; }
         }
 
-        public MpvProcess(string executable, uint windowId)
+        public MpvProcess(string executable, uint windowId, int initialVolume, int subPos, int subScale)
         {
+            _initialVolume = initialVolume;
+            _subPos = subPos;
+            _subScale = subScale;
             _executable = executable;
             _windowId = windowId;
             _pipeName = "LumaPlayer-" + Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N");
@@ -1193,6 +1855,9 @@ namespace LumaPlayer
         {
             string pipePath = "\\\\.\\pipe\\" + _pipeName;
             string inputConfig = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "input.conf");
+            string watchLaterDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LumaPlayer", "watch_later");
+            try { Directory.CreateDirectory(watchLaterDir); } catch { }
             string arguments = String.Join(" ", new string[]
             {
                 "--wid=" + _windowId.ToString(CultureInfo.InvariantCulture),
@@ -1216,8 +1881,22 @@ namespace LumaPlayer
                 "--video-sync=display-resample",
                 "--audio-pitch-correction=yes",
                 "--sub-auto=fuzzy",
+                "--sub-file-paths=\"sub;subs;subtitles;Subs;Subtitles;字幕\"",
+                // Put subtitles into black bars when the picture has them (e.g. a
+                // wide film in full screen), for plain-text and ASS subtitles alike.
+                "--sub-use-margins=yes",
+                "--sub-ass-force-margins=yes",
+                "--sub-pos=" + _subPos.ToString(CultureInfo.InvariantCulture),
+                "--sub-scale=" + (_subScale / 100.0).ToString("0.##", CultureInfo.InvariantCulture),
                 "--audio-file-auto=fuzzy",
-                "--osd-level=0"
+                "--osd-level=0",
+                "--volume=" + _initialVolume.ToString(CultureInfo.InvariantCulture),
+                // Resume where the user stopped. The host writes the resume point
+                // explicitly when switching files or closing; only the position and
+                // track choices are restored, not volume, speed or pause.
+                "--resume-playback=yes",
+                "--watch-later-dir=\"" + watchLaterDir + "\"",
+                "--watch-later-options=aid,sid,sub-delay,audio-delay"
             });
 
             ProcessStartInfo startInfo = new ProcessStartInfo();
@@ -1329,7 +2008,15 @@ namespace LumaPlayer
                     IDictionary<string, object> message = parsed as IDictionary<string, object>;
                     if (message == null)
                         continue;
-                    HandleMessage(message);
+                    try
+                    {
+                        HandleMessage(message);
+                    }
+                    catch (Exception ex)
+                    {
+                        // A failing UI handler must not be reported as an engine crash.
+                        Trace.WriteLine("Luma Player: " + ex);
+                    }
                 }
             }
             catch (Exception ex)
@@ -1840,6 +2527,7 @@ namespace LumaPlayer
         public event EventHandler ValueChanged;
         public event EventHandler SeekStarted;
         public event EventHandler SeekEnded;
+        public event EventHandler PreviewChanged;
 
         public double Value
         {
@@ -1849,9 +2537,18 @@ namespace LumaPlayer
                 double next = Math.Max(0, Math.Min(1, value));
                 if (Math.Abs(_value - next) < 0.0001)
                     return;
+                int before = FilledWidth(_value);
                 _value = next;
-                Invalidate();
+                // Repaint only when the thumb actually moves by a pixel.
+                if (FilledWidth(next) != before)
+                    Invalidate();
             }
+        }
+
+        private int FilledWidth(double value)
+        {
+            int usableWidth = Math.Max(1, ClientSize.Width - 7 * 2);
+            return (int)Math.Round(usableWidth * value);
         }
 
         public SeekBar()
@@ -1927,12 +2624,9 @@ namespace LumaPlayer
             int margin = 7;
             int usableWidth = Math.Max(1, ClientSize.Width - margin * 2);
             Value = (x - margin) / (double)usableWidth;
-            if (notify)
-            {
-                EventHandler changed = ValueChanged;
-                if (changed != null)
-                    changed(this, EventArgs.Empty);
-            }
+            EventHandler handler = notify ? ValueChanged : PreviewChanged;
+            if (handler != null)
+                handler(this, EventArgs.Empty);
         }
 
         private static GraphicsPath RoundedRect(Rectangle rectangle, int radius)

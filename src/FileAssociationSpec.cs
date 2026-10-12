@@ -6,6 +6,9 @@ namespace LumaPlayer
     {
         public const string ApplicationName = "Luma Player";
         public const string ProgId = "LumaPlayer.Video";
+        public const string NewWindowArgument = "--new-window";
+        public const string NewWindowVerb = "openNewWindow";
+        public const string NewWindowVerbLabel = "在新窗口中播放";
 
         public static readonly string[] Extensions = new string[]
         {
@@ -16,6 +19,11 @@ namespace LumaPlayer
         public static string BuildOpenCommand(string executable)
         {
             return Quote(executable) + " \"%1\"";
+        }
+
+        public static string BuildNewWindowCommand(string executable)
+        {
+            return Quote(executable) + " " + NewWindowArgument + " \"%1\"";
         }
 
         public static string BuildIconValue(string executable)

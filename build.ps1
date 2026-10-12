@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$SkipMpvDownload
 )
 
@@ -24,6 +24,7 @@ New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 
 & $csc `
     /nologo `
+    /codepage:65001 `
     /target:winexe `
     /optimize+ `
     /platform:x64 `
