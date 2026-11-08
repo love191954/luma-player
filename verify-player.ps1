@@ -1,4 +1,4 @@
-﻿param(
+param(
     [Parameter(Mandatory = $true, Position = 0)]
     [string]$VideoFile,
 
@@ -97,6 +97,20 @@ public static class LumaPlayerWindowProbe {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
     [DllImport("user32.dll")]
+    public static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+
+    public static IntPtr FindVisibleButton(IntPtr parent, string caption) {
+        IntPtr result = IntPtr.Zero;
+        EnumChildWindows(parent, delegate(IntPtr child, IntPtr ignored) {
+            StringBuilder text = new StringBuilder(64);
+            GetWindowText(child, text, text.Capacity);
+            if (!IsWindowVisible(child) || text.ToString() != caption) return true;
+            result = child;
+            return false;
+        }, IntPtr.Zero);
+        return result;
+    }
+    [DllImport("user32.dll")]
     public static extern bool GetCursorInfo(ref CURSORINFO info);
 
     public static string[] GetVisibleChildTexts(IntPtr parent) {
@@ -122,6 +136,7 @@ public static class LumaPlayerWindowProbe {
 try {
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new($resolvedPlayerPath)
     $startInfo.UseShellExecute = $false
+    $startInfo.ArgumentList.Add("--new-window")
     $startInfo.ArgumentList.Add($videoPath)
     $player = [System.Diagnostics.Process]::Start($startInfo)
     if ($null -eq $player) { throw "无法启动 Luma Player。" }
@@ -159,17 +174,43 @@ try {
     $normalRect = [LumaPlayerWindowProbe+RECT]::new()
     [LumaPlayerWindowProbe]::GetWindowRect($player.MainWindowHandle, [ref]$normalRect) | Out-Null
     $visibleControlTexts = @([LumaPlayerWindowProbe]::GetVisibleChildTexts($player.MainWindowHandle))
-    $expectedControlTexts = @("打开", "−10 秒", "暂停", "+10 秒", "静音", "音量", "倍速 1×", "音轨", "字幕", "关联格式", "全屏")
+    $expectedControlTexts = @("打开", "−10 秒", "暂停", "+10 秒", "静音", "音量", "倍速 1×", "音轨", "字幕", "设置", "全屏")
     $controlsVisible = @($expectedControlTexts | Where-Object { $_ -notin $visibleControlTexts }).Count -eq 0
     $timeDisplayVisible = @(@("已播放", "剩余", "总时长") | Where-Object {
         $prefix = $_
         @($visibleControlTexts | Where-Object { $_.StartsWith($prefix) }).Count -gt 0
     }).Count -eq 3
 
-    Send-EmbeddedCommand -Command @("set_property", "pause", $true)
-    Start-Sleep -Milliseconds 250
-    $pauseWorked = [bool](Get-EmbeddedProperty -Name "pause")
-    Send-EmbeddedCommand -Command @("set_property", "pause", $false)
+    # Replacing a playing file emits end-file for the old one. Wait for the
+    # replacement before testing the actual toolbar button and playback clock.
+    Send-EmbeddedCommand -Command @("loadfile", $videoPath, "replace")
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        $read = $reader.ReadLineAsync()
+        if (-not $read.Wait(5000) -or $null -eq $read.Result) { throw "换片超时" }
+        $event = $read.Result | ConvertFrom-Json
+    } until ($event.event -eq "file-loaded" -or [DateTime]::UtcNow -gt $deadline)
+    if ($event.event -ne "file-loaded") { throw "未收到换片完成事件" }
+    foreach ($caption in @("暂停", "播放", "暂停")) {
+        $deadline = [DateTime]::UtcNow.AddSeconds(4)
+        do {
+            Start-Sleep -Milliseconds 50
+            $button = [LumaPlayerWindowProbe]::FindVisibleButton($player.MainWindowHandle, $caption)
+        } until ($button -ne [IntPtr]::Zero -or [DateTime]::UtcNow -gt $deadline)
+        if ($button -eq [IntPtr]::Zero) { throw "播放工具栏缺少按钮：$caption" }
+        if ($caption -eq "暂停" -and $pauseWorked) { break }
+        [LumaPlayerWindowProbe]::SendMessage($button, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null # BM_CLICK
+        Start-Sleep -Milliseconds 250
+        $expectedPause = $caption -eq "暂停"
+        if ((Get-EmbeddedProperty -Name "pause") -ne $expectedPause) { throw "点击后暂停状态错误：$caption" }
+        $first = Get-EmbeddedProperty -Name "time-pos"
+        Start-Sleep -Milliseconds 400
+        $last = Get-EmbeddedProperty -Name "time-pos"
+        if ($null -eq $first -or $null -eq $last -or (($last -eq $first) -ne $expectedPause)) {
+            throw "点击后播放时间异常：$caption"
+        }
+        $pauseWorked = $true
+    }
 
     Send-EmbeddedCommand -Command @("seek", 60, "absolute+exact")
     Start-Sleep -Milliseconds 500
