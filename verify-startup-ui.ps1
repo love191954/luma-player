@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$PlayerPath
 )
 
@@ -85,7 +85,7 @@ public static class LumaStartupProbe {
 
 $expectedTexts = @(
     "已播放 00:00", "剩余 00:00", "总时长 00:00", "打开", "−10 秒", "播放",
-    "+10 秒", "静音", "音量", "倍速 1×", "音轨", "字幕", "关联格式", "全屏", "等待打开视频"
+    "+10 秒", "静音", "音量", "倍速 1×", "音轨", "字幕", "设置", "全屏", "等待打开视频"
 )
 $process = $null
 
@@ -104,7 +104,7 @@ function Convert-BoundsSnapshot {
 
 try {
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
-    $process = [System.Diagnostics.Process]::Start($resolvedPlayerPath)
+    $process = [System.Diagnostics.Process]::Start($resolvedPlayerPath, "--new-window")
     if ($null -eq $process) { throw "无法启动 Luma Player。" }
 
     $deadline = [DateTime]::UtcNow.AddSeconds(10)

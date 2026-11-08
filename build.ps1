@@ -37,6 +37,7 @@ New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
     /reference:System.Web.Extensions.dll `
     /out:"$(Join-Path $outputDir 'LumaPlayer.exe')" `
     $associationSpecPath `
+    "$(Join-Path $sourceDir 'ResumeEntry.cs')" `
     "$(Join-Path $sourceDir 'LumaPlayer.cs')"
 
 if ($LASTEXITCODE -ne 0) {

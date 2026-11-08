@@ -301,6 +301,25 @@ namespace LumaPlayer
             _emptyState.Controls.Add(_emptyHint);
             _emptyState.Controls.Add(_emptyTitle);
             _emptyState.Controls.Add(_emptyMark);
+            if (String.IsNullOrEmpty(initialFile))
+            {
+                ResumeEntry resume = ResumeEntry.FindLatest(ResumeEntry.DirectoryPath);
+                if (resume != null)
+                {
+                    _emptyState.Height += 44;
+                    Button button = CreateTextButton("继续播放  ·  " + Path.GetFileName(resume.FilePath)
+                        + "  ·  " + FormatTime(resume.Position.TotalSeconds), 480);
+                    button.Dock = DockStyle.Bottom;
+                    button.Click += delegate
+                    {
+                        if (!File.Exists(resume.FilePath))
+                            button.Visible = false;
+                        LoadFile(resume.FilePath);
+                    };
+                    _emptyState.Controls.Add(button);
+                    button.SendToBack();
+                }
+            }
             _videoSurface.Controls.Add(_emptyState);
 
             _controls = new BufferedPanel();
@@ -672,7 +691,7 @@ namespace LumaPlayer
             if (!_hasFile || _mpv == null || !_mpv.IsRunning)
                 return;
             // Finished videos start from the beginning next time.
-            bool finished = _eofReached || (_duration > 0 && _position >= _duration - 5);
+            bool finished = _eofReached || (_duration > 0 && _position >= _duration - Math.Min(5, _duration * 0.05));
             _mpv.Command(finished ? "delete-watch-later-config" : "write-watch-later-config");
         }
 
@@ -757,6 +776,7 @@ namespace LumaPlayer
             SetPlaybackSpeed(1);
             UpdateTimeLabels(0, 0);
             _mpv.Command("loadfile", path, "replace");
+            _mpv.SetProperty("pause", false);
         }
 
         private void SetPlaybackButtons(bool enabled)
@@ -776,7 +796,7 @@ namespace LumaPlayer
         {
             if (!_hasFile || _mpv == null)
                 return;
-            _mpv.SetProperty("pause", !_isPaused);
+            _mpv.Command("cycle", "pause");
         }
 
         private void ToggleMute()
@@ -906,11 +926,6 @@ namespace LumaPlayer
                     _emptyState.Visible = false;
                     AddPendingSubtitles();
                     RefreshMediaStatus();
-                }
-                else if (eventName == "end-file")
-                {
-                    _isPaused = true;
-                    UpdatePauseButton();
                 }
                 else if (eventName == "shutdown")
                 {
@@ -1855,8 +1870,7 @@ namespace LumaPlayer
         {
             string pipePath = "\\\\.\\pipe\\" + _pipeName;
             string inputConfig = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "input.conf");
-            string watchLaterDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LumaPlayer", "watch_later");
+            string watchLaterDir = ResumeEntry.DirectoryPath;
             try { Directory.CreateDirectory(watchLaterDir); } catch { }
             string arguments = String.Join(" ", new string[]
             {
@@ -1896,7 +1910,8 @@ namespace LumaPlayer
                 // track choices are restored, not volume, speed or pause.
                 "--resume-playback=yes",
                 "--watch-later-dir=\"" + watchLaterDir + "\"",
-                "--watch-later-options=aid,sid,sub-delay,audio-delay"
+                "--write-filename-in-watch-later-config=yes",
+                "--watch-later-options=start,aid,sid,sub-delay,audio-delay"
             });
 
             ProcessStartInfo startInfo = new ProcessStartInfo();
