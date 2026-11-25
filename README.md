@@ -19,8 +19,9 @@ Windows 10/11 会要求在“默认应用”页面完成最终确认。播放器
 
 ## 下载软件包
 
-- [下载 LumaPlayer-0.4.1-win-x64.zip](./LumaPlayer-0.4.1-win-x64.zip)
-- [打开 GitHub v0.4.1 发行版](https://github.com/love191954/luma-player/releases/tag/v0.4.1)
+[下载最新版 Windows x64 发布包](https://github.com/love191954/luma-player/releases/latest)：打开发布页，在 **Assets** 下下载 Windows x64 ZIP。
+
+> **V0.4.2 发布包说明：** 首页“继续播放”按钮和切换视频后的暂停修复已合入 [`main`](https://github.com/love191954/luma-player/pull/2)，但尚未包含在 V0.4.2 的 Windows ZIP 中。
 
 ## 操作
 
@@ -38,7 +39,7 @@ Windows 10/11 会要求在“默认应用”页面完成最终确认。播放器
 | 字幕上移 / 下移 | `Ctrl+↑` / `Ctrl+↓` |
 | 字幕恢复默认 | `Ctrl+0` |
 
-播放中途关闭窗口或切换视频会保存进度。下次直接启动播放器，点击首页的“继续播放”即可从显示的时间接着看最近未看完的视频。直接打开同一文件也会恢复进度和音轨/字幕。看完的视频再次打开时从头开始。续播记录保存在 `%LocalAppData%\LumaPlayer\watch_later`。
+**V0.4.2 发布包：** 重新打开同一视频会恢复上次的进度和音轨/字幕；看完的视频再次打开时从头开始。续播记录保存在 `%LocalAppData%\LumaPlayer\watch_later`。
 
 默认只用一个窗口：播放器已经打开时，再双击其他视频会在现有窗口中切换播放。想同时看多个视频时，可以：
 
